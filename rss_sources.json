@@ -1,0 +1,37 @@
+[
+  {
+    "name": "Bloomberg Markets",
+    "url": "https://feeds.bloomberg.com/markets/news.rss",
+    "timezone": "UTC",
+    "active": true,
+    "notes": "Best all-round. Real-time."
+  },
+  {
+    "name": "Bloomberg Politics", 
+    "url": "https://feeds.bloomberg.com/politics/news.rss",
+    "timezone": "UTC",
+    "active": true,
+    "notes": "Trump, US policy, Iran diplomacy."
+  },
+  {
+    "name": "Al Jazeera",
+    "url": "https://www.aljazeera.com/xml/rss/all.xml",
+    "timezone": "UTC",
+    "active": true,
+    "notes": "Best for Middle East breaking news."
+  },
+  {
+    "name": "BBC World",
+    "url": "https://feeds.bbci.co.uk/news/world/rss.xml",
+    "timezone": "UTC",
+    "active": true,
+    "notes": "Reliable geopolitics."
+  },
+  {
+    "name": "OilPrice",
+    "url": "https://oilprice.com/rss/main",
+    "timezone": "UTC-5",
+    "active": true,
+    "notes": "Oil-specific. Timestamps UTC-5."
+  }
+]
