@@ -38,7 +38,7 @@ load_dotenv()
 # CONFIG
 # ─────────────────────────────────────────────
 SCRIPT_DIR          = Path(__file__).parent
-RELEVANCE_FILE      = SCRIPT_DIR / "market_relevance.json"
+RELEVANCE_FILE      = Path(__file__).parent / 'market_relevance.json'
 DATA_API            = "https://data-api.polymarket.com"
 GAMMA_API           = "https://gamma-api.polymarket.com"
 

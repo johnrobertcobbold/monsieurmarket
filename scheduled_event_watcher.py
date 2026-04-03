@@ -27,7 +27,7 @@ log = logging.getLogger("MonsieurMarket.EventWatcher")
 
 EVENTS_FILE = Path("scheduled_events.json")
 RSS_FILE    = Path("rss_sources.json")
-TRADES_DIR  = Path("trades")
+TRADES_DIR  = Path("data/trades")
 
 
 def _load_events() -> list:

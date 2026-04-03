@@ -1,3 +1,28 @@
+# ── secrets ──────────────────────────────────
+.env
+
+# ── data / runtime state ─────────────────────
+data/
+trades/
+
+# ── polymarket ───────────────────────────────
+polymarket/market_relevance.json
+polymarket/polymarket_markets.json
+
+# ── bloomberg ────────────────────────────────
+bloomberg_camoufox/monitor_state.json
+bloomberg_camoufox/bloomberg_feed.json
+bloomberg_camoufox/bloomberg_session.json
+bloomberg_camoufox/chrome_profile/
+
+# ── old paths (keep for safety) ──────────────
+monsieur_market_state.json
+monsieur_market.log
+market_relevance.json
+whale_wallets.json
+
+# ── python ───────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
+venv/

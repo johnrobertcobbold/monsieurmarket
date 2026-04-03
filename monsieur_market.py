@@ -25,12 +25,29 @@ import threading
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
+
+Path("data").mkdir(exist_ok=True)
+Path("data/trades").mkdir(exist_ok=True)
+
 from scheduled_event_watcher import ScheduledEventWatcher
+from config import CONFIG
+
+from bloomberg_watcher import BloombergWatcher
+_bloomberg = BloombergWatcher()
 
 from dotenv import load_dotenv
 load_dotenv()  # loads .env from same directory
 
 import anthropic
+
+# Polymarket
+from polymarket import (
+    check_polymarket,
+    update_whale_ledger,
+    format_repeat_whale_alert,
+    aggregate_whale_signals,
+    start_polymarket_ws,
+)
 
 # IG Markets (optional — only imported if credentials present)
 try:
@@ -51,233 +68,10 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("monsieur_market.log"),
+        logging.FileHandler("data/monsieur_market.log"),
     ],
 )
 log = logging.getLogger("MonsieurMarket")
-
-
-# ─────────────────────────────────────────────
-# CONFIGURATION — edit this section
-# ─────────────────────────────────────────────
-CONFIG = {
-    # Polling interval in minutes — news is background context, not the trigger
-    # Real triggers are price moves (streaming) and whale flow (Polymarket)
-    "poll_interval_minutes": 60,
-
-    # Deduplication window in hours
-    # Signals older than this are forgotten and can re-alert
-    "dedup_window_hours": 4,
-
-    # Minimum Sonnet materiality score to trigger alert (1–10)
-    "alert_threshold": 6,
-
-    # Quiet hours (Paris time, 24h format) — no alerts except YANBU override
-    "quiet_hours_start": 0,   # midnight
-    "quiet_hours_end": 7,     # 7am
-
-    # Minimum trade size to track at all (goes into ledger)
-    "whale_threshold_usd": 10000,
-    # Minimum single trade for INSTANT Telegram alert (bypass accumulation)
-    "whale_instant_alert_usd": 100000,
-
-    # External file for Polymarket markets — edit without restarting the bot
-    # To refresh tokens: python3 -c "import requests,json; d=requests.get('https://gamma-api.polymarket.com/events/158299').json(); [print(m['question'], json.loads(m['clobTokenIds'])) for m in d['markets']]"
-    "polymarket_markets_file": "polymarket_markets.json",
-
-    # ── THEMES ──────────────────────────────────────────────────────────────
-    "themes": [
-        {
-            "name": "US Ground Op / Kharg",
-            "active": True,
-            "wake_override": False,  # respects quiet hours
-            "keywords": [
-                "Kharg", "Kharg Island", "Hormuz", "Strait of Hormuz",
-                "boots on the ground", "ground forces Iran",
-                "US troops Iran", "special forces Iran",
-                "Iran military operation", "Iran invasion",
-                "carrier group Iran", "amphibious Iran",
-            ],
-            "tradables": [
-                {
-                    "name": "Brent Crude",
-                    "ticker": "BRN",
-                    "type": "turbo_long",
-                    "my_position": "long",
-                    "signal_direction": "bullish",
-                    "conviction": "high",
-                },
-                {
-                    "name": "Thales",
-                    "ticker": "HO.PA",
-                    "type": "equity",
-                    "my_position": "long",
-                    "signal_direction": "bullish",
-                    "conviction": "high",
-                },
-                {
-                    "name": "TotalEnergies",
-                    "ticker": "TTE.PA",
-                    "type": "equity",
-                    "my_position": "watching",
-                    "signal_direction": "bullish",
-                    "conviction": "medium",
-                },
-                {
-                    "name": "FTSE 100",
-                    "ticker": "UKX",
-                    "type": "index",
-                    "my_position": "watching",
-                    "signal_direction": "bullish",
-                    "conviction": "medium",
-                    "note": "Oil-heavy index, benefits from Brent spike",
-                },
-                {
-                    "name": "CAC 40",
-                    "ticker": "PX1",
-                    "type": "index",
-                    "my_position": "short_candidate",
-                    "signal_direction": "bearish",
-                    "conviction": "medium",
-                    "note": "Luxury-heavy, hurt by oil shock and risk-off",
-                },
-            ],
-        },
-        {
-            "name": "Houthi Escalation",
-            "active": True,
-            "wake_override": False,  # set True per escalation trigger below
-            "keywords": [
-                "Houthi", "Houthis", "Ansarallah",
-                "Yemen", "Yemen strike", "Yemen missile",
-                "Red Sea attack", "Red Sea shipping",
-                "tanker attack", "shipping disruption",
-                "Bab el-Mandeb", "Gulf of Aden",
-                "Houthi missile Israel", "Houthi drone",
-            ],
-            # These keywords trigger wake override AND level-3 alert
-            "escalation_triggers": [
-                "Yanbu",
-                "Saudi oil",
-                "Aramco",
-                "Ras Tanura",
-            ],
-            "tradables": [
-                {
-                    "name": "Brent Crude",
-                    "ticker": "BRN",
-                    "type": "turbo_long",
-                    "my_position": "long",
-                    "signal_direction": "bullish",
-                    "conviction": "high",
-                },
-                {
-                    "name": "Thales",
-                    "ticker": "HO.PA",
-                    "type": "equity",
-                    "my_position": "long",
-                    "signal_direction": "bullish",
-                    "conviction": "medium",
-                },
-                {
-                    "name": "TotalEnergies",
-                    "ticker": "TTE.PA",
-                    "type": "equity",
-                    "my_position": "watching",
-                    "signal_direction": "bullish",
-                    "conviction": "medium",
-                },
-            ],
-            # Houthi escalation ladder
-            "alert_levels": {
-                "level_1": {
-                    "description": "Houthis firing at Israel",
-                    "score_range": [4, 6],
-                    "note": "Ongoing background noise, mild Brent positive",
-                },
-                "level_2": {
-                    "description": "Houthis targeting Red Sea shipping",
-                    "score_range": [6, 8],
-                    "note": "Brent +$5-10 expected. Check turbo barrier.",
-                },
-                "level_3": {
-                    "description": "Houthis targeting Yanbu / Saudi infrastructure",
-                    "score_range": [8, 10],
-                    "note": "Bloomberg Economics: $140 Brent scenario. ACT NOW.",
-                    "wake_override": True,  # always wake for this
-                },
-            },
-        },
-
-        # ── Future themes — flip active: True to enable ──────────────────
-        {
-            "name": "European Rearmament",
-            "active": False,
-            "wake_override": False,
-            "keywords": [
-                "NATO spending", "defense budget Europe",
-                "rearmament", "European army",
-                "defense procurement",
-            ],
-            "tradables": [
-                {"name": "Rheinmetall", "ticker": "RHM.DE",
-                 "signal_direction": "bullish", "conviction": "high"},
-                {"name": "Leonardo", "ticker": "LDO.MI",
-                 "signal_direction": "bullish", "conviction": "high"},
-                {"name": "BAE Systems", "ticker": "BA.L",
-                 "signal_direction": "bullish", "conviction": "high"},
-            ],
-        },
-        {
-            "name": "French Political Risk",
-            "active": False,
-            "wake_override": False,
-            "keywords": [
-                "dissolution Assemblée", "élections France",
-                "motion de censure", "gouvernement chute",
-                "crise politique France",
-            ],
-            "tradables": [
-                {"name": "CAC 40", "ticker": "PX1",
-                 "signal_direction": "bearish", "conviction": "high"},
-            ],
-        },
-    ],
-
-    # ── PRICE WATCHER (Lightstreamer real-time stream) ──────────────────────
-    "price_watcher": {
-        "enabled": True,
-        "trigger_pct_from_open": 1.5,   # alert if day move exceeds this %
-        "cooldown_min": 15,             # minimum minutes between price alerts
-        # Multiple rolling windows — catches moves at different speeds
-        # Format: (window_minutes, threshold_pct, label)
-        "rolling_windows": [
-            # (1,  0.3, "1min"),  # disabled — too noisy without IG execution
-            (5,  0.6,  "5min"),   # fast move — 0.6% in 5min
-            (10, 1.0,  "10min"),  # sustained move — 1.0% in 10min
-        ],
-    },
-
-    # ── WHALE AGGREGATION ───────────────────────────────────────────────────
-    "whale_triggers": {
-        # Single trade above this → always triggers Sonnet (strong conviction)
-        "single_trade_usd": 50000,
-        # One trader's cumulative flow this cycle above this → triggers
-        "single_trader_usd": 75000,
-        # Net directional flow (all Yes buys minus all No buys) above this → triggers
-        # Must also be >70% one-directional (not mixed)
-        "net_flow_usd": 150000,
-        "net_flow_min_pct": 0.70,   # 70% of volume must be one direction
-    },
-
-    # ── WEEKLY DIGEST ───────────────────────────────────────────────────────
-    "weekly_digest": {
-        "enabled": True,
-        "day": "sunday",
-        "time": "09:00",  # Paris time
-    },
-}
-
 
 # ─────────────────────────────────────────────
 # POLYMARKET MARKETS — loaded from external JSON
@@ -309,7 +103,7 @@ def load_polymarket_markets() -> list:
 # ─────────────────────────────────────────────
 # STATE — remembers what we already alerted on
 # ─────────────────────────────────────────────
-STATE_FILE = Path("monsieur_market_state.json")
+STATE_FILE = Path("data/monsieur_market_state.json")
 
 
 def load_state() -> dict:
@@ -386,120 +180,6 @@ def send_telegram(message: str, force: bool = False) -> bool:
     except Exception as e:
         log.error(f"Telegram send failed: {e}")
         return False
-
-
-# ─────────────────────────────────────────────
-# POLYMARKET
-# ─────────────────────────────────────────────
-POLYMARKET_DATA_API = "https://data-api.polymarket.com"
-
-
-def fetch_polymarket_trades(condition_id: str) -> list:
-    """Fetch recent whale trades for a Polymarket market via data-api."""
-    try:
-        r = requests.get(
-            f"{POLYMARKET_DATA_API}/trades",
-            params={
-                "market": condition_id,
-                "limit": 50,
-                "takerOnly": "true",
-                "filterType": "CASH",
-                "filterAmount": CONFIG["whale_threshold_usd"],
-            },
-            timeout=10,
-        )
-        r.raise_for_status()
-        return r.json() or []
-    except Exception as e:
-        log.warning(f"Polymarket fetch failed for {condition_id[:16]}…: {e}")
-        return []
-
-
-def check_polymarket(state: dict) -> tuple[list, dict]:
-    """
-    Check all watched markets for new whale trades and price moves.
-    Returns (new_signals, updated_state).
-    """
-    signals = []
-    threshold = CONFIG["whale_threshold_usd"]
-    markets = load_polymarket_markets()
-
-    for market_config in markets:
-        condition_id = market_config["conditionId"]
-        label        = market_config["label"]
-        trades       = fetch_polymarket_trades(condition_id)
-
-        if not trades:
-            log.debug(f"Polymarket: no trades for {label}")
-
-        for trade in trades:
-            try:
-                trade_id = trade.get("transactionHash", "")
-                size     = float(trade.get("size", 0))
-                price    = float(trade.get("price", 0))
-                outcome  = trade.get("outcome", "")
-                side     = trade.get("side", "BUY")
-                pseudonym  = trade.get("pseudonym") or ""
-                proxy      = trade.get("proxyWallet", "")
-                trader     = pseudonym or proxy or "anon"
-                amount     = size * price  # CASH value of trade
-
-                if trade_id in state["seen_trade_ids"]:
-                    continue
-
-                state["seen_trade_ids"][trade_id] = time.time()
-
-                # Save wallet mapping for portfolio lookups
-                if pseudonym and proxy:
-                    wallets = state.setdefault("whale_wallets", {})
-                    wallets[pseudonym] = proxy
-
-                if amount < threshold:
-                    continue
-
-                trade_ts = trade.get("timestamp") or trade.get("createdAt") or time.time()
-                try:
-                    trade_ts = float(trade_ts)
-                except Exception:
-                    trade_ts = time.time()
-
-                signals.append({
-                    "type": "whale_trade",
-                    "market": label,
-                    "trader": str(trader)[:30],
-                    "proxy_wallet": proxy,
-                    "amount": amount,
-                    "outcome": outcome,
-                    "price": price,
-                    "side": side,
-                    "trade_id": trade_id,
-                    "ts": trade_ts,
-                })
-                log.info(f"🐋 Polymarket whale: {trader} ${amount:,.0f} {side} {outcome} @ {price:.2f} on {label}")
-
-            except Exception as e:
-                log.debug(f"Trade parse error: {e}")
-                continue
-
-        # Check price movement (last trade price vs previous)
-        try:
-            if trades:
-                latest_price = float(trades[0].get("price", 0))
-                last_price   = state["last_prices"].get(condition_id)
-                if last_price and abs(latest_price - last_price) >= 0.05:
-                    signals.append({
-                        "type": "price_move",
-                        "market": label,
-                        "from_price": last_price,
-                        "to_price": latest_price,
-                        "move_pct": (latest_price - last_price) / last_price * 100,
-                    })
-                state["last_prices"][condition_id] = latest_price
-        except Exception:
-            pass
-
-    return signals, state
-
 
 # ─────────────────────────────────────────────
 # HAIKU — cheap first-pass filter
@@ -1084,6 +764,17 @@ def _on_brent_tick(ticker):
     send_telegram(message, force=True)
     _price_state.mark_alerted()
     log.info(f"Price alert sent — {alert_reason[:60]}")
+
+    def _bloomberg_on_demand():
+        headlines = _bloomberg.refresh_now()
+        if headlines:
+            titles = '\n'.join(f"• {h['title']}" for h in headlines[:3])
+            send_telegram(
+                f"📰 <b>Bloomberg — fresh context</b>\n\n{titles}",
+                force=True,
+            )
+
+    threading.Thread(target=_bloomberg_on_demand, daemon=True).start()
 
 class _MarketListener(SubscriptionListener if IG_AVAILABLE else object):
     """Lightstreamer MARKET subscription listener — called on every price update."""
@@ -1732,131 +1423,6 @@ def format_ig_block(ig: dict) -> str:
 
 
 # ─────────────────────────────────────────────
-# WHALE AGGREGATION
-# ─────────────────────────────────────────────
-def aggregate_whale_signals(whale_signals: list) -> dict:
-    """
-    Summarise raw whale trades into actionable intel.
-
-    Returns:
-    {
-        "total_volume_usd": float,
-        "net_yes_usd": float,       # positive = net BUY Yes, negative = net SELL Yes
-        "yes_volume": float,
-        "no_volume": float,
-        "dominant_side": "YES" | "NO" | "MIXED",
-        "top_traders": [{"name": str, "total_usd": float, "direction": str}],
-        "market_breakdown": {"market_label": {"yes": float, "no": float}},
-        "summary_text": str,        # human-readable one-liner for Sonnet
-    }
-    """
-    if not whale_signals:
-        return {}
-
-    total = 0.0
-    yes_vol = 0.0
-    no_vol  = 0.0
-    traders: dict = {}
-    markets: dict = {}
-
-    for s in whale_signals:
-        if s.get("type") != "whale_trade":
-            continue
-        amount  = s.get("amount", 0)
-        outcome = s.get("outcome", "").upper()
-        side    = s.get("side", "BUY").upper()
-        trader  = s.get("trader", "anon")
-        market  = s.get("market", "unknown")
-
-        # Count as Yes if buying Yes OR selling No (both are bullish on Yes)
-        is_yes_bullish = (outcome == "YES" and side == "BUY") or \
-                         (outcome == "NO"  and side == "SELL")
-        is_no_bullish  = (outcome == "NO"  and side == "BUY") or \
-                         (outcome == "YES" and side == "SELL")
-
-        total += amount
-        if is_yes_bullish:
-            yes_vol += amount
-        elif is_no_bullish:
-            no_vol  += amount
-
-        # Per-trader aggregation
-        if trader not in traders:
-            traders[trader] = {"yes": 0.0, "no": 0.0}
-        if is_yes_bullish:
-            traders[trader]["yes"] += amount
-        elif is_no_bullish:
-            traders[trader]["no"]  += amount
-
-        # Per-market aggregation
-        if market not in markets:
-            markets[market] = {"yes": 0.0, "no": 0.0}
-        if is_yes_bullish:
-            markets[market]["yes"] += amount
-        elif is_no_bullish:
-            markets[market]["no"]  += amount
-
-    net_yes = yes_vol - no_vol
-    if abs(net_yes) < total * 0.1:
-        dominant = "MIXED"
-    elif net_yes > 0:
-        dominant = "YES"
-    else:
-        dominant = "NO"
-
-    # Top 5 traders by total volume
-    top_traders = sorted(
-        [
-            {
-                "name": name,
-                "total_usd": v["yes"] + v["no"],
-                "direction": "YES" if v["yes"] >= v["no"] else "NO",
-                "yes_usd": v["yes"],
-                "no_usd":  v["no"],
-            }
-            for name, v in traders.items()
-        ],
-        key=lambda x: x["total_usd"],
-        reverse=True,
-    )[:5]
-
-    # One-liner summary
-    direction_str = "strongly BUY Yes" if dominant == "YES" and net_yes > total * 0.5 \
-        else "leaning BUY Yes" if dominant == "YES" \
-        else "strongly BUY No (bearish on event)" if dominant == "NO" and abs(net_yes) > total * 0.5 \
-        else "leaning BUY No" if dominant == "NO" \
-        else "mixed / neutral"
-
-    top_name = top_traders[0]["name"] if top_traders else "unknown"
-    top_amt  = top_traders[0]["total_usd"] if top_traders else 0
-
-    market_lines = ", ".join(
-        f"{m}: ${v['yes']:,.0f} Yes / ${v['no']:,.0f} No"
-        for m, v in markets.items()
-    )
-
-    summary_text = (
-        f"${total:,.0f} total whale flow — {direction_str} "
-        f"(net ${abs(net_yes):,.0f} {'Yes' if net_yes >= 0 else 'No'}). "
-        f"Top trader: {top_name} ${top_amt:,.0f}. "
-        f"Markets: {market_lines}"
-    )
-
-    log.info(f"🐋 Whale summary: {summary_text}")
-
-    return {
-        "total_volume_usd": total,
-        "net_yes_usd": net_yes,
-        "yes_volume": yes_vol,
-        "no_volume":  no_vol,
-        "dominant_side": dominant,
-        "top_traders": top_traders,
-        "market_breakdown": markets,
-        "summary_text": summary_text,
-    }
-
-
-# ─────────────────────────────────────────────
 # WHALE LEDGER — cross-cycle accumulation tracking
 # ─────────────────────────────────────────────
 WHALE_LEDGER_WINDOW_H = 24   # hours to keep whale history
@@ -1972,7 +1538,7 @@ def format_repeat_whale_alert(alerts: list, market: str = "") -> str | None:
 def _run_portfolio_check(trader: str, proxy_wallet: str):
     """Call check_whale_portfolio.py in a subprocess and send results via Telegram."""
     import subprocess
-    script = Path(__file__).parent / "check_whale_portfolio.py"
+    script = Path(__file__).parent / "polymarket" / "check_whale_portfolio.py"
     if not script.exists():
         log.debug("check_whale_portfolio.py not found — skipping")
         return
@@ -2167,6 +1733,19 @@ def run_poll():
         state["last_news_poll"] = time.time()
         log.info(f"RSS: {len(all_headlines)} new headlines")
 
+    # ── Step 2.5: Bloomberg liveblog / latest ──
+    bloomberg_headlines = _bloomberg.fetch_new_headlines()
+    if bloomberg_headlines:
+        log.info(f"Bloomberg: {len(bloomberg_headlines)} relevant headline(s)")
+        all_headlines = bloomberg_headlines + all_headlines
+
+        # Bloomberg is premium — force Sonnet even without whale trigger
+        if not whale_flow_trigger:
+            whale_flow_trigger   = True
+            whale_trigger_reason = (
+                f"Bloomberg: {bloomberg_headlines[0].get('title', '')[:50]}"
+            )
+
     # ── Step 3: Per-theme processing ──
     for theme in CONFIG["themes"]:
         if not theme.get("active"):
@@ -2267,6 +1846,7 @@ def main():
     # Send startup message
     send_telegram(
         "🎩 <b>MonsieurMarket is online</b>\n"
+        f"Bloomberg: {_bloomberg.get_status()}\n"
         f"News poll: every {CONFIG['poll_interval_minutes']} min\n"
         f"Trump watcher: every 2 min 🇺🇸\n"
         f"Active themes: {', '.join(t['name'] for t in CONFIG['themes'] if t.get('active'))}\n"
