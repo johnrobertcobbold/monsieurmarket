@@ -322,6 +322,7 @@ Claude will search for current event dates and output a ready-to-paste JSON with
 - [ ] European Rearmament theme activation
 - [ ] X/Twitter monitoring ($100/month API tier)
 - [ ] Additional signal sources via /signal API (Reuters live, FT, etc.)
+- [ ] Local model evaluation — assess Ollama (Gemma 4, Qwen, Phi) on M3 Air for zero-cost filtering (trump pre-filter, Bloomberg relevance, UKMTO triage). Benchmark quality vs Haiku. If viable, design as optional drop-in so the same code runs on MacBook, Pi, or EC2 with local inference where available and Haiku as fallback.
 
 ---
 

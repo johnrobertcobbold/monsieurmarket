@@ -1,4 +1,3 @@
-# polymarket/__init__.py
 from .polymarket import (
     load_polymarket_markets,
     check_polymarket,
@@ -7,4 +6,5 @@ from .polymarket import (
     format_repeat_whale_alert,
     run_portfolio_check,
     start_polymarket_ws,
+    WHALE_REPEAT_TRIGGER,
 )

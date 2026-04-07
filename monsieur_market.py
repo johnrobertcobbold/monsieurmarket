@@ -44,11 +44,14 @@ import anthropic
 
 # Polymarket
 from polymarket import (
+    load_polymarket_markets,
     check_polymarket,
     update_whale_ledger,
     format_repeat_whale_alert,
     aggregate_whale_signals,
+    run_portfolio_check,
     start_polymarket_ws,
+    WHALE_REPEAT_TRIGGER,
 )
 
 # IG Markets (optional — only imported if credentials present)
@@ -76,28 +79,8 @@ logging.basicConfig(
 log = logging.getLogger("MonsieurMarket")
 
 # ─────────────────────────────────────────────
-# POLYMARKET MARKETS
+# POLYMARKET — imported from polymarket/ module
 # ─────────────────────────────────────────────
-MARKETS_FILE        = Path(CONFIG["polymarket_markets_file"])
-POLYMARKET_DATA_API = CONFIG["polymarket_data_api"]
-POLYMARKET_WS       = CONFIG["polymarket_ws"]
-
-
-def load_polymarket_markets() -> list:
-    try:
-        markets = json.loads(MARKETS_FILE.read_text())
-        markets = [m for m in markets if m.get("active", True)]
-        log.debug(f"Loaded {len(markets)} Polymarket market(s) from {MARKETS_FILE}")
-        return markets
-    except FileNotFoundError:
-        log.error(f"Polymarket markets file not found: {MARKETS_FILE}")
-        return []
-    except json.JSONDecodeError as e:
-        log.error(f"Invalid JSON in {MARKETS_FILE}: {e}")
-        return []
-    except Exception as e:
-        log.error(f"Failed to load {MARKETS_FILE}: {e}")
-        return []
 
 
 # ─────────────────────────────────────────────
@@ -950,162 +933,10 @@ def start_price_watcher():
 
 
 # ─────────────────────────────────────────────
-# POLYMARKET WEBSOCKET
+# POLYMARKET WEBSOCKET — extracted to polymarket/
 # ─────────────────────────────────────────────
-def _polymarket_ws_worker():
-    try:
-        import websocket as ws_lib
-    except ImportError:
-        log.warning("websocket-client not installed — Polymarket RT stream unavailable")
-        return
-
-    def _build_token_map() -> dict:
-        token_map = {}
-        for m in load_polymarket_markets():
-            if m.get("yes_token"):
-                token_map[m["yes_token"]] = {"label": m["label"], "outcome": "YES"}
-            if m.get("no_token"):
-                token_map[m["no_token"]] = {"label": m["label"], "outcome": "NO"}
-        return token_map
-
-    threshold = CONFIG["whale_threshold_usd"]
-
-    def _lookup_trader_by_hash(tx_hash: str) -> str:
-        if not tx_hash:
-            return "unknown"
-        try:
-            time.sleep(2)
-            r = requests.get(
-                f"{POLYMARKET_DATA_API}/trades",
-                params={"transaction_hash": tx_hash, "limit": 5},
-                timeout=5,
-            )
-            trades = r.json() or []
-            for t in trades:
-                ps = t.get("pseudonym") or t.get("proxyWallet", "")
-                if ps:
-                    return ps
-        except Exception as e:
-            log.info(f"[trader] hash lookup failed: {e}")
-        return "unknown"
-
-    def on_open(ws):
-        log.info("Polymarket WS: connected")
-        token_map  = _build_token_map()
-        all_tokens = list(token_map.keys())
-        ws.send(json.dumps({"type": "subscribe", "assets_ids": all_tokens}))
-        log.info(f"Polymarket WS: subscribed to {len(all_tokens)} tokens")
-        ws._token_map = token_map
-
-    def on_message(ws, raw):
-        try:
-            if raw == "pong":
-                return
-            data     = json.loads(raw)
-            msg_type = data.get("event_type") or data.get("type")
-            if msg_type != "last_trade_price":
-                return
-
-            token_map = getattr(ws, "_token_map", {})
-            asset_id  = data.get("asset_id", "")
-            price     = float(data.get("price", 0))
-            size      = float(data.get("size", 0))
-            side      = data.get("side", "BUY").upper()
-            tx_hash   = data.get("transaction_hash", "")
-            amount    = price * size
-
-            if asset_id not in token_map or amount < threshold:
-                return
-
-            market_info = token_map[asset_id]
-            label       = market_info["label"]
-            outcome     = market_info["outcome"]
-
-            trader = _lookup_trader_by_hash(tx_hash)
-            log.info(f"🐋 RT Whale: {trader} {label} {outcome} {side} ${amount:,.0f} @ {price:.3f}")
-
-            state    = load_state()
-            trade_id = f"ws_{asset_id[:8]}_{data.get('timestamp', int(time.time()))}"
-
-            if trade_id not in state.get("seen_trade_ids", {}):
-                state.setdefault("seen_trade_ids", {})[trade_id] = time.time()
-                whale_signal = [{
-                    "type": "whale_trade", "market": label, "trader": trader,
-                    "amount": amount, "outcome": outcome, "price": price,
-                    "side": side, "trade_id": trade_id,
-                }]
-                state, repeat_alerts = update_whale_ledger(state, whale_signal)
-
-                now_str   = datetime.now().strftime("%d/%m %H:%M")
-                direction = "📈 BUY Yes" if (outcome == "YES" and side == "BUY") or \
-                                           (outcome == "NO"  and side == "SELL") \
-                            else "📉 BUY No"
-                size_emoji = "🐋🐋" if amount >= CONFIG["whale_instant_alert_usd"] else "🐋"
-
-                ts_raw         = data.get("timestamp")
-                trade_time_str = ""
-                if ts_raw:
-                    try:
-                        ts_int = int(ts_raw)
-                        ts_dt  = datetime.fromtimestamp(ts_int / 1000 if ts_int > 1e10 else ts_int)
-                        trade_time_str = f"\nTrade time: {ts_dt.strftime('%d/%m %H:%M:%S')}"
-                    except Exception:
-                        pass
-
-                send_message(
-                    f"{size_emoji} <b>Polymarket — Whale</b>\n\n"
-                    f"<b>{trader}</b>\n"
-                    f"{direction} <b>${amount:,.0f}</b> @ {price:.2f}\n"
-                    f"Market: {label}"
-                    f"{trade_time_str}\n"
-                    f"\n⏰ {now_str}"
-                )
-
-                if repeat_alerts:
-                    repeat_msg = format_repeat_whale_alert(repeat_alerts, label)
-                    if repeat_msg:
-                        send_message(repeat_msg)
-
-                save_state(state)
-
-        except Exception as e:
-            log.debug(f"Polymarket WS message error: {e}")
-
-    def on_error(ws, error):
-        log.warning(f"Polymarket WS error: {error}")
-
-    def on_close(ws, code, msg):
-        log.info(f"Polymarket WS closed: {code} {msg}")
-
-    def ping_loop(ws):
-        while True:
-            time.sleep(10)
-            try:
-                ws.send("ping")
-            except Exception:
-                break
-
-    while True:
-        try:
-            log.info("Polymarket WS: connecting...")
-            ws = ws_lib.WebSocketApp(
-                POLYMARKET_WS,
-                on_open=on_open, on_message=on_message,
-                on_error=on_error, on_close=on_close,
-            )
-            threading.Thread(target=ping_loop, args=(ws,), daemon=True).start()
-            ws.run_forever()
-            log.warning("Polymarket WS disconnected — reconnecting in 10s")
-        except Exception as e:
-            log.error(f"Polymarket WS fatal: {e} — reconnecting in 30s")
-            time.sleep(30)
-        time.sleep(10)
-
-
-def start_polymarket_ws():
-    t = threading.Thread(target=_polymarket_ws_worker, name="PolymarketWS", daemon=True)
-    t.start()
-    log.info("Polymarket WS thread started")
+# start_polymarket_ws is imported from polymarket module
+# callbacks passed so it can send Telegram and manage state
 
 
 # ─────────────────────────────────────────────
@@ -1216,120 +1047,8 @@ def format_ig_block(ig: dict) -> str:
 
 
 # ─────────────────────────────────────────────
-# WHALE LEDGER
-# ─────────────────────────────────────────────
-WHALE_LEDGER_WINDOW_H = 24
-WHALE_REPEAT_TRIGGER  = 50000
-
-
-def update_whale_ledger(state: dict, whale_signals: list) -> tuple[dict, list]:
-    now    = time.time()
-    cutoff = now - WHALE_LEDGER_WINDOW_H * 3600
-    ledger = state.get("whale_ledger", {})
-
-    for name in list(ledger.keys()):
-        ledger[name] = [e for e in ledger[name] if e["ts"] > cutoff]
-        if not ledger[name]:
-            del ledger[name]
-
-    repeat_alerts = []
-
-    for s in whale_signals:
-        if s.get("type") != "whale_trade":
-            continue
-        trader    = s.get("trader", "anon")
-        proxy     = s.get("proxy_wallet", "")
-        amount    = s.get("amount", 0)
-        outcome   = s.get("outcome", "")
-        side      = s.get("side", "BUY")
-        is_yes    = (outcome.upper() == "YES" and side.upper() == "BUY") or \
-                    (outcome.upper() == "NO"  and side.upper() == "SELL")
-        direction = "YES" if is_yes else "NO"
-
-        if trader not in ledger:
-            ledger[trader] = []
-
-        prev_total = sum(e["amount"] for e in ledger[trader])
-        ledger[trader].append({
-            "amount": amount, "direction": direction,
-            "proxy_wallet": proxy, "ts": now,
-        })
-        new_total = prev_total + amount
-        prev_band = int(prev_total / WHALE_REPEAT_TRIGGER)
-        new_band  = int(new_total  / WHALE_REPEAT_TRIGGER)
-
-        if new_band > prev_band:
-            yes_total = sum(e["amount"] for e in ledger[trader] if e["direction"] == "YES")
-            no_total  = sum(e["amount"] for e in ledger[trader] if e["direction"] == "NO")
-            dominant  = "YES (bullish)" if yes_total >= no_total else "NO (bearish)"
-            trades    = len(ledger[trader])
-            band_usd  = new_band * WHALE_REPEAT_TRIGGER
-            proxy     = next(
-                (e.get("proxy_wallet","") for e in ledger[trader] if e.get("proxy_wallet")), ""
-            )
-            repeat_alerts.append({
-                "trader": trader, "proxy_wallet": proxy,
-                "total_usd": new_total, "band_usd": band_usd,
-                "dominant": dominant, "yes_usd": yes_total,
-                "no_usd": no_total, "trades": trades,
-            })
-
-    state["whale_ledger"] = ledger
-    return state, repeat_alerts
-
-
-def format_repeat_whale_alert(alerts: list, market: str = "") -> str | None:
-    if not alerts:
-        return None
-    lines = ["🐋 <b>MonsieurMarket — Repeat Whale Alert</b>\n"]
-    for a in alerts:
-        band = a.get("band_usd", a["total_usd"])
-        lines.append(
-            f"<b>{a['trader']}</b> crossed <b>${band:,.0f}</b> threshold\n"
-            f"  Total (24h): ${a['total_usd']:,.0f} over {a['trades']} trades\n"
-            f"  Direction: {a['dominant']}\n"
-            f"  ${a['yes_usd']:,.0f} Yes / ${a['no_usd']:,.0f} No"
-        )
-    if market:
-        lines.append(f"\nMarket: {market}")
-    lines.append(f"\n⏰ {datetime.now().strftime('%d/%m %H:%M')}")
-    return "\n".join(lines)
-
-
-# ─────────────────────────────────────────────
 # MAIN POLLING LOOP (disabled — too expensive)
 # ─────────────────────────────────────────────
-def _run_portfolio_check(trader: str, proxy_wallet: str):
-    """Call check_whale_portfolio.py in a subprocess and send results via Telegram."""
-    import subprocess
-    script = Path(__file__).parent / "polymarket" / "check_whale_portfolio.py"
-    if not script.exists():
-        log.debug("check_whale_portfolio.py not found — skipping")
-        return
-    try:
-        result = subprocess.run(
-            ["/opt/homebrew/bin/python3", str(script), proxy_wallet],
-            capture_output=True, text=True, timeout=60,
-            cwd=str(Path(__file__).parent),
-        )
-        if result.returncode != 0:
-            log.warning(f"Portfolio check failed: {result.stderr[:200]}")
-            return
-        data         = json.loads(result.stdout)
-        new_relevant = data.get("new_relevant", [])
-        if not new_relevant:
-            log.info(f"Portfolio check for {trader}: no new relevant markets")
-            return
-        lines = [f"🔍 <b>Whale Portfolio — {trader}</b>\n"]
-        lines.append("New relevant markets found:\n")
-        for m in new_relevant:
-            lines.append(f"  • <b>{m['title']}</b>")
-            lines.append(f"    {m['reason']}  |  whale position: ${m['whale_amount']:,.0f} {m['direction']}")
-        lines.append(f"\n⏰ {datetime.now().strftime('%d/%m %H:%M')}")
-        send_message("\n".join(lines))
-        log.info(f"Portfolio check for {trader}: {len(new_relevant)} new relevant market(s)")
-    except Exception as e:
-        log.warning(f"Portfolio check error: {e}")
 
 
 def fetch_rss_headlines(state: dict) -> tuple[list[dict], dict]:
@@ -1436,8 +1155,8 @@ def run_poll():
             trader = alert.get("trader", "")
             if proxy:
                 threading.Thread(
-                    target=_run_portfolio_check,
-                    args=(trader, proxy),
+                    target=run_portfolio_check,
+                    args=(trader, proxy, send_message),
                     daemon=True,
                 ).start()
 
@@ -1547,7 +1266,7 @@ def main():
 
     markets = load_polymarket_markets()
     if not markets:
-        log.warning(f"No Polymarket markets loaded from {MARKETS_FILE}")
+        log.warning("No Polymarket markets loaded — whale tracking inactive")
     else:
         log.info(f"Loaded {len(markets)} Polymarket market(s)")
 
@@ -1576,7 +1295,11 @@ def main():
     )
 
     start_price_watcher()
-    start_polymarket_ws()
+    start_polymarket_ws(
+        send_telegram_fn=send_message,
+        load_state_fn=load_state,
+        save_state_fn=save_state,
+    )
     start_trump_watcher()
 
     global event_watcher
