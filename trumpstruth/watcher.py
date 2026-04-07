@@ -1,41 +1,33 @@
 """
 trumpstruth/watcher.py — Trump Truth Social monitor.
 
-Polls trumpstruth.org/feed (third-party RSS mirror of Truth Social) every 2 min.
-Haiku filters for oil/Iran/geopolitical relevance — no keyword pre-filter since
-Trump often signals obliquely (e.g. 'a civilization will die tonight').
-Sonnet + web search analyses relevant posts and sends to Telegram.
+Polls trumpstruth.org/feed every 2 min.
+Detects new posts and signals MM via /signal endpoint.
+MM handles all filtering, analysis, and Telegram.
 
 Note: trumpstruth.org is a third-party mirror, not an official source.
 If it goes down, replace TRUMP_RSS with another mirror or use the X/Twitter API.
 """
 
-import os
 import re
 import time
 import logging
 import threading
 import requests
-from datetime import datetime
-
-import anthropic
-
-from config import CONFIG
-from telegram_client import send_message
+from pathlib import Path
+import json
 
 log = logging.getLogger('MonsieurMarket')
 
 TRUMP_RSS     = "https://trumpstruth.org/feed"
 POLL_INTERVAL = 120  # seconds
+MM_SIGNAL_URL = "http://localhost:3456/signal"
 
 
 # ─────────────────────────────────────────────
-# STATE — imported from MM to share the same file
+# STATE
 # ─────────────────────────────────────────────
 def _load_state() -> dict:
-    """Load state from MM state file."""
-    from pathlib import Path
-    import json
     state_file = Path("data/monsieur_market_state.json")
     if state_file.exists():
         try:
@@ -46,8 +38,6 @@ def _load_state() -> dict:
 
 
 def _save_state(state: dict):
-    from pathlib import Path
-    import json
     Path("data/monsieur_market_state.json").write_text(json.dumps(state, indent=2))
 
 
@@ -77,66 +67,20 @@ def _fetch_trump_posts() -> list[dict]:
 
 
 # ─────────────────────────────────────────────
-# HAIKU FILTER
+# SIGNAL MM
 # ─────────────────────────────────────────────
-def _haiku_trump_filter(post: dict) -> bool:
-    """
-    Haiku decides if a Trump post is relevant to oil/Iran/geopolitics.
-    No keyword pre-filter — Trump often signals obliquely
-    (e.g. 'a civilization will die tonight' = Iran strike context).
-    Haiku calls are cheap and Trump posts are infrequent (~few per day).
-    """
+def _signal_mm(post: dict):
+    """POST new Trump post to MM /signal endpoint. MM handles everything else."""
     try:
-        client   = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=10,
-            messages=[{"role": "user", "content":
-                f"Does this Trump post relate to oil prices, Iran, Saudi Arabia, "
-                f"OPEC, Middle East conflict, energy markets, or military action?\n\n"
-                f'"{post["title"]}"\n\n'
-                f"Reply YES or NO only."
-            }],
-        )
-        return response.content[0].text.strip().upper().startswith("YES")
+        requests.post(MM_SIGNAL_URL, json={
+            "source": "trump",
+            "type":   "post",
+            "data":   {"title": post["title"], "url": post["url"]},
+            "ts":     time.time(),
+        }, timeout=5)
+        log.info(f"Trump signal → MM: {post['title'][:60]}")
     except Exception as e:
-        log.debug(f"Haiku Trump filter error: {e}")
-        return False
-
-
-# ─────────────────────────────────────────────
-# SONNET ANALYSIS
-# ─────────────────────────────────────────────
-def _sonnet_analyze_trump(post: dict) -> str | None:
-    try:
-        client      = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-        themes_text = ", ".join(t["name"] for t in CONFIG["themes"] if t.get("active"))
-        response    = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=600,
-            messages=[{"role": "user", "content":
-                f"Trump just posted on Truth Social:\n\n"
-                f'"{post["title"]}"\n\n'
-                f"Active trading themes: {themes_text}\n"
-                f"The trader is long Brent crude (knock-out turbo) and long Thales.\n\n"
-                f"In 4-5 sentences max: what does this post imply for Brent crude price? "
-                f"Bullish or bearish and why? What 2 things should the trader watch next? "
-                f"Be direct and specific — no fluff. No markdown headers."
-            }],
-            tools=[{
-                "type": "web_search_20260209",
-                "name": "web_search",
-                "max_uses": 2,
-            }],
-        )
-        text_blocks = [
-            block.text for block in response.content
-            if hasattr(block, "text") and block.text and block.text.strip()
-        ]
-        return " ".join(text_blocks).strip() or None
-    except Exception as e:
-        log.warning(f"Sonnet Trump analysis error: {e}")
-        return None
+        log.warning(f"Trump signal to MM failed: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -174,22 +118,7 @@ def _trump_watcher_worker():
 
             for post in new_posts:
                 log.info(f"Trump post: {post['title'][:80]}")
-
-                if not _haiku_trump_filter(post):
-                    log.info("  → not relevant — skipping")
-                    continue
-
-                log.info("  → RELEVANT — firing Sonnet analysis")
-                analysis = _sonnet_analyze_trump(post)
-
-                if analysis:
-                    send_message(
-                        f"🇺🇸 <b>MonsieurMarket — Trump Alert</b>\n\n"
-                        f"<i>{post['title'][:300]}</i>\n\n"
-                        f"🧠 <b>Sonnet:</b> {analysis}\n\n"
-                        f"⏰ {datetime.now().strftime('%d/%m %H:%M')}"
-                    )
-                    log.info("  → Trump alert sent")
+                _signal_mm(post)
 
         except Exception as e:
             log.error(f"Trump watcher error: {e}")

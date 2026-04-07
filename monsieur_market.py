@@ -34,7 +34,7 @@ Path("data/trades").mkdir(exist_ok=True)
 
 from scheduled_event_watcher import ScheduledEventWatcher
 from config import CONFIG
-from telegram_client import send_message, format_bloomberg_post
+from telegram import send_message, format_bloomberg_post
 from trumpstruth import start_trump_watcher
 
 from dotenv import load_dotenv
@@ -779,8 +779,9 @@ def _handle_signal(source: str, stype: str, data: dict):
     try:
         if source == 'bloomberg':
             _handle_bloomberg_signal(stype, data)
+        elif source == 'trump':
+            _handle_trump_signal(stype, data)
         # Future sources plug in here:
-        # elif source == 'price':      _handle_price_signal(stype, data)
         # elif source == 'ukmto':      _handle_ukmto_signal(stype, data)
         # elif source == 'polymarket': _handle_polymarket_signal(stype, data)
     except Exception as e:
@@ -808,6 +809,82 @@ def _handle_bloomberg_signal(stype: str, data: dict):
 
     elif stype == 'error':
         log.warning(f"Bloomberg monitor error: {data.get('msg', '')}")
+
+
+def _handle_trump_signal(stype: str, data: dict):
+    """
+    Handle Trump post signals from trumpstruth watcher.
+    Haiku filters, Sonnet analyses, MM sends to Telegram.
+    """
+    if stype != 'post':
+        return
+
+    post  = data
+    title = post.get('title', '')
+    url   = post.get('url', '')
+    log.info(f"Trump signal received: {title[:80]}")
+
+    # Haiku filter — cheap yes/no
+    try:
+        client   = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=10,
+            messages=[{"role": "user", "content":
+                f"Does this Trump post relate to oil prices, Iran, Saudi Arabia, "
+                f"OPEC, Middle East conflict, energy markets, or military action?\n\n"
+                f'"{title}"\n\n'
+                f"Reply YES or NO only."
+            }],
+        )
+        relevant = response.content[0].text.strip().upper().startswith("YES")
+    except Exception as e:
+        log.debug(f"Haiku Trump filter error: {e}")
+        relevant = False
+
+    if not relevant:
+        log.info("  → not relevant — skipping")
+        return
+
+    log.info("  → RELEVANT — firing Sonnet analysis")
+
+    # Sonnet analysis + web search
+    try:
+        themes_text = ", ".join(t["name"] for t in CONFIG["themes"] if t.get("active"))
+        response    = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=600,
+            messages=[{"role": "user", "content":
+                f"Trump just posted on Truth Social:\n\n"
+                f'"{title}"\n\n'
+                f"Active trading themes: {themes_text}\n"
+                f"The trader is long Brent crude (knock-out turbo) and long Thales.\n\n"
+                f"In 4-5 sentences max: what does this post imply for Brent crude price? "
+                f"Bullish or bearish and why? What 2 things should the trader watch next? "
+                f"Be direct and specific — no fluff. No markdown headers."
+            }],
+            tools=[{
+                "type": "web_search_20260209",
+                "name": "web_search",
+                "max_uses": 2,
+            }],
+        )
+        analysis = " ".join(
+            block.text for block in response.content
+            if hasattr(block, "text") and block.text and block.text.strip()
+        ).strip()
+    except Exception as e:
+        log.warning(f"Sonnet Trump analysis error: {e}")
+        analysis = None
+
+    if analysis:
+        send_message(
+            f"🇺🇸 <b>MonsieurMarket — Trump Alert</b>\n\n"
+            f"<i>{title[:300]}</i>\n\n"
+            f"🧠 <b>Sonnet:</b> {analysis}\n\n"
+            f"⏰ {datetime.now().strftime('%d/%m %H:%M')}"
+        )
+        log.info("  → Trump alert sent")
 
 
 def start_mm_api():
