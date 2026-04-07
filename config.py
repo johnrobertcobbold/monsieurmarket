@@ -49,7 +49,10 @@ CONFIG = {
 
     # ── EXTERNAL API ENDPOINTS ───────────────────────────────────────────────────
     "polymarket_data_api": "https://data-api.polymarket.com",
-    "polymarket_ws":       "wss://ws-subscriptions-clob.polymarket.com/ws/market",    
+    "polymarket_ws":       "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+
+    # ── DISPLAY ──────────────────────────────────────────────────────────────
+    "display_timezone": "Europe/Paris",
 
     # ── THEMES ───────────────────────────────────────────────────────────────
     "themes": [

@@ -762,8 +762,8 @@ def _scrape_liveblog(page) -> list[dict]:
 
             return {
                 id:            id,
-                title:         bodyEl?.textContent?.trim()?.slice(0, 120) || '',
-                body:          bodyEl?.textContent?.trim()?.slice(0, 500) || '',
+                title:         bodyEl?.textContent?.trim()?.slice(0, 300) || '',
+                body:          bodyEl?.textContent?.trim()?.slice(0, 1000) || '',
                 timestamp_raw: timeEl?.getAttribute('datetime') || '',
                 url:           window.location.href.split('#')[0] + (id ? '#' + id : ''),
                 author:        byline?.textContent?.replace('By ', '').trim() || '',

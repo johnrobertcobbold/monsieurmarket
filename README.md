@@ -296,6 +296,7 @@ Claude will search for current event dates and output a ready-to-paste JSON with
 ## Roadmap
 
 ### Near-term
+- [ ] UKMTO monitor — scrape https://www.ukmto.org/ukmto-products/warnings/2026 for maritime warnings, plug into /signal (primary source, often precedes Bloomberg by 10-30 min)
 - [ ] ig/ folder — extract Brent price watcher and IG REST into ig/ module
 - [ ] monitor.py split — scrapers.py, navigation.py, source_finder.py
 - [ ] state.py — extract state management

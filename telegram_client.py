@@ -2,15 +2,27 @@
 telegram_client.py — single place for all Telegram messaging.
 
 Usage:
-    from telegram_client import send_message, format_bloomberg_posts
+    from telegram_client import send_message, format_bloomberg_post
 """
 
 import os
 import logging
 import requests
 from datetime import datetime
+from config import CONFIG
+from zoneinfo import ZoneInfo
 
 log = logging.getLogger('MonsieurMarket')
+
+_TZ = ZoneInfo(CONFIG.get('display_timezone', 'UTC'))
+
+def _to_local_time(iso: str) -> str:
+    """Convert ISO UTC timestamp to local display time (from config display_timezone)."""
+    try:
+        dt = datetime.fromisoformat(iso.replace('Z', '+00:00'))
+        return dt.astimezone(_TZ).strftime('%d/%m %H:%M')
+    except Exception:
+        return iso[:16].replace('T', ' ') + ' UTC'
 
 
 def send_message(message: str, force: bool = False) -> bool:
@@ -38,23 +50,12 @@ def send_message(message: str, force: bool = False) -> bool:
         log.error(f"Telegram send failed: {e}")
         return False
 
-
-def format_bloomberg_posts(posts: list[dict], trigger: str = 'poll') -> str:
-    """
-    Format Bloomberg posts into a Telegram message.
-
-    trigger='poll'        — background 15-min cycle, just the headlines
-    trigger='price_spike' — triggered by Brent move, adds context header
-    """
-    if trigger == 'price_spike':
-        header = "📰 <b>Bloomberg — fresh context after price move</b>\n"
-    else:
-        header = "📰 <b>Bloomberg — new posts</b>\n"
-
-    lines = [header]
-    for p in posts[:5]:
-        ts = p.get('timestamp_raw', '')[:16].replace('T', ' ')
-        lines.append(f"• [{ts}] {p.get('title', '')[:100]}")
-
-    lines.append(f"\n⏰ {datetime.now().strftime('%d/%m %H:%M')} Paris")
-    return "\n".join(lines)
+def format_bloomberg_post(post: dict) -> str:
+    """Format a single Bloomberg post for Telegram."""
+    ts   = _to_local_time(post.get('timestamp_raw') or post.get('timestamp', ''))
+    text = post.get('body') or post.get('title', '')
+    return (
+        f"📰 <b>Bloomberg</b>\n\n"
+        f"• [{ts}] {text}\n\n"
+        f"⏰ {datetime.now().astimezone(_TZ).strftime('%d/%m %H:%M')}"
+    )

@@ -33,7 +33,7 @@ Path("data/trades").mkdir(exist_ok=True)
 
 from scheduled_event_watcher import ScheduledEventWatcher
 from config import CONFIG
-from telegram_client import send_message, format_bloomberg_posts
+from telegram_client import send_message, format_bloomberg_post
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -815,18 +815,8 @@ def _handle_bloomberg_signal(stype: str, data: dict):
         bloomberg_scheduler.on_no_source()
 
     elif stype == 'post':
-        # New post — send to Telegram immediately.
-        # No keyword filter needed — source is already a relevant liveblog or tag.
-        # Brain logic here later: score, correlate with price/whales, etc.
-        ts    = (data.get('timestamp_raw') or data.get('timestamp', ''))[:16].replace('T', ' ')
-        title = data.get('title', '')
-        log.info(f"Bloomberg post: [{ts}] {title[:60]}")
-
-        send_message(
-            f"📰 <b>Bloomberg</b>\n\n"
-            f"• [{ts}] {title[:120]}\n\n"
-            f"⏰ {datetime.now().strftime('%d/%m %H:%M')} Paris"
-        )
+        log.info(f"Bloomberg post: {data.get('title', '')[:60]}")
+        send_message(format_bloomberg_post(data))
 
     elif stype == 'error':
         log.warning(f"Bloomberg monitor error: {data.get('msg', '')}")
