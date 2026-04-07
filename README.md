@@ -11,11 +11,11 @@ Built on Anthropic Claude (Haiku for filtering, Sonnet for analysis) + Camoufox 
 ### Real-time (sub-second)
 - **Brent price stream** via IG Lightstreamer — fires on 5min/10min/day-open moves
 - **Polymarket websocket** — whale trades ($10k+) tracked in real-time, instant alert >$100k
-- **Bloomberg on-demand** — triggered automatically on Brent price alerts, fetches fresh context
+- **Bloomberg on-demand** — triggered automatically on Brent price alerts, fetches fresh context via scheduler
 
-### Near real-time (less than 2 min)
-- **Trump watcher** — polls trumpstruth.org/feed every 2 min, Haiku filters, Sonnet analyses relevant posts immediately
-- **Bloomberg monitor** — scrapes Bloomberg homepage and /latest/war-with-iran every 15 min via Camoufox
+### Near real-time
+- **Trump watcher** — polls trumpstruth.org/feed every 2 min, Haiku filters (no keyword pre-filter — oblique posts handled), Sonnet analyses relevant posts immediately
+- **Bloomberg monitor** — scrapes Bloomberg liveblog or best In Focus tag on a market-hours-aware schedule (5 min during 08-22 UTC, 15 min pre-market, 60 min overnight). MM owns the schedule, monitor is purely reactive.
 
 ### Scheduled event monitoring
 - **Event watcher** — hot-reloadable scheduled_events.json defines known events (NFP, OPEC, speeches)
@@ -34,20 +34,42 @@ Built on Anthropic Claude (Haiku for filtering, Sonnet for analysis) + Camoufox 
 ## Architecture
 
 ```
-monsieur_market.py              <- orchestrator
-        |
-        +-- bloomberg_watcher.py        <- reads Bloomberg API
-        |       +-- bloomberg_camoufox/
-        |               +-- monitor.py  <- Camoufox browser, Flask :3457
-        |               +-- setup.py    <- one-time Bloomberg auth
-        |
-        +-- polymarket/
-        |       +-- polymarket.py       <- trades, ledger, websocket
-        |
-        +-- scheduled_event_watcher.py  <- event windows, trade logs
-        +-- config.py                   <- all configuration
-        +-- bloomberg_watcher.py        <- MonsieurMarket <-> Bloomberg bridge
+run.sh
+  └── monsieur_market.py          <- brain, orchestrator, signal router
+        │
+        ├── MM Signal API :3456   <- /signal endpoint, all sources POST here
+        │
+        ├── bloomberg_camoufox/
+        │     └── monitor.py      <- Camoufox browser, Flask :3457
+        │                            NO internal timer — waits for MM /refresh calls
+        │                            POSTs signals back to MM on new posts
+        │
+        ├── polymarket/
+        │     └── polymarket.py   <- trades, ledger, websocket
+        │
+        ├── scheduled_event_watcher.py  <- event windows, trade logs
+        └── config.py                   <- all configuration
 ```
+
+### Signal flow
+
+```
+monitor.py      →  POST /signal {source: bloomberg, type: ready|post|error}
+                →  MM receives, BloombergScheduler starts, Telegram sent
+
+Brent spike     →  BloombergScheduler.trigger_now()
+                →  GET /refresh on monitor
+                →  monitor scrapes, POSTs new posts as signals
+                →  MM sends to Telegram
+
+Trump post      →  Haiku filter (no keyword pre-check)
+                →  Sonnet + web search analysis
+                →  Telegram alert
+```
+
+### Telegram responsibility
+All Telegram messages originate from `monsieur_market.py` via `telegram_client.py`.
+Monitor never sends Telegram directly — it signals MM, MM decides.
 
 ---
 
@@ -55,39 +77,36 @@ monsieur_market.py              <- orchestrator
 
 ```
 monsieurmarket/
-+-- .env                          <- secrets, never commit
-+-- config.py                     <- all configuration + themes
-+-- monsieur_market.py            <- main entry point
-+-- bloomberg_watcher.py          <- Bloomberg connector
-+-- scheduled_event_watcher.py    <- event monitoring
-+-- scheduled_events.json         <- hot-reloadable event definitions
-+-- rss_sources.json              <- curated RSS feeds
-+-- run.sh                        <- start script
-|
-+-- bloomberg_camoufox/           <- Bloomberg scraping layer
-|   +-- monitor.py                <- Camoufox browser + Flask API :3457
-|   +-- setup.py                  <- one-time headful login
-|   +-- bloomberg_session.json    <- gitignored, saved cookies
-|   +-- bloomberg_feed.json       <- gitignored, scraped posts
-|   +-- monitor_state.json        <- gitignored, saved tag state
-|
-+-- polymarket/                   <- Polymarket intelligence
-|   +-- polymarket.py             <- trades, ledger, websocket
-|   +-- check_whale_portfolio.py  <- portfolio analysis
-|   +-- polymarket_markets.json   <- gitignored, watched markets
-|   +-- market_relevance.json     <- gitignored, relevance cache
-|
-+-- data/                         <- gitignored, runtime state
-|   +-- monsieur_market_state.json
-|   +-- monsieur_market.log
-|   +-- trades/                   <- markdown trade logs per event
-|
-+-- scripts/                      <- one-off setup utilities
-|   +-- find_epic.py              <- find IG instrument epics
-|   +-- find_polymarket.py        <- search Polymarket markets
-|   +-- get_token_ids.py          <- get yes/no token IDs
-|
-+-- venv/                         <- gitignored, Python virtualenv
+├── .env                          <- secrets, never commit
+├── config.py                     <- all configuration + themes
+├── monsieur_market.py            <- main entry point + brain
+├── telegram_client.py            <- single place for all Telegram messaging
+├── scheduled_event_watcher.py    <- event monitoring
+├── scheduled_events.json         <- hot-reloadable event definitions
+├── rss_sources.json              <- curated RSS feeds
+├── run.sh                        <- start script (starts MM which starts monitor)
+│
+├── bloomberg_camoufox/           <- Bloomberg scraping layer
+│   ├── monitor.py                <- Camoufox browser + Flask API :3457
+│   └── setup.py                  <- one-time headful login
+│   (gitignored: bloomberg_session.json, bloomberg_feed.json, monitor_state.json)
+│
+├── polymarket/                   <- Polymarket intelligence
+│   ├── polymarket.py             <- trades, ledger, websocket
+│   ├── check_whale_portfolio.py  <- portfolio analysis
+│   (gitignored: polymarket_markets.json, market_relevance.json)
+│
+├── data/                         <- gitignored, runtime state
+│   ├── monsieur_market_state.json
+│   ├── monsieur_market.log
+│   └── trades/                   <- markdown trade logs per event
+│
+├── scripts/                      <- one-off setup utilities
+│   ├── find_epic.py              <- find IG instrument epics
+│   ├── find_polymarket.py        <- search Polymarket markets
+│   └── get_token_ids.py          <- get yes/no token IDs
+│
+└── venv/                         <- gitignored, Python virtualenv
 ```
 
 ---
@@ -135,12 +154,11 @@ python bloomberg_camoufox/setup.py
 ### 5. Run
 
 ```bash
-# terminal 1 - Bloomberg monitor
-python bloomberg_camoufox/monitor.py
-
-# terminal 2 - main bot
-python monsieur_market.py
+./run.sh             # headless Bloomberg (default)
+./run.sh --visible   # watch Bloomberg browse in a real browser window
 ```
+
+MM starts everything — no need to run monitor separately.
 
 ---
 
@@ -148,27 +166,43 @@ python monsieur_market.py
 
 Runs a persistent Camoufox (Firefox) browser session that:
 
-1. Opens Bloomberg homepage and scans for active liveblog
+1. Opens Bloomberg homepage and scans for active liveblog (today's date in URL)
 2. If no liveblog, clicks "See all latest", Haiku picks best In Focus tag (once per day, saved to disk)
-3. Navigates to /latest/war-with-iran or equivalent
-4. Scrapes headlines every 15 min with jitter
-5. Serves via Flask API on :3457
+3. Navigates to the liveblog or tag page
+4. Waits for `/refresh` calls from MonsieurMarket — **no internal timer**
+5. On scrape, POSTs each new post to MM `/signal` endpoint
+6. Serves via Flask API on :3457
 
-Run modes:
+MM owns the refresh schedule:
+- 08:00–22:00 UTC: every ~5 min (with jitter)
+- 06:00–08:00 UTC: every ~15 min
+- 22:00–06:00 UTC: every ~60 min
 
-```bash
-python bloomberg_camoufox/monitor.py            # headless
-python bloomberg_camoufox/monitor.py --visible  # watch it work
-```
-
-API endpoints:
+Monitor API (internal, used by MM):
 
 | Endpoint | Description |
 |---|---|
-| GET /health | Status, source type, post count, next retry |
+| GET /health | Status, source type, post count |
 | GET /posts?since=ts | Posts newer than timestamp |
 | GET /latest | Most recent post |
-| GET /refresh | Immediate scrape, called on price spike |
+| GET /refresh | Immediate scrape triggered by MM |
+
+---
+
+## MM Signal API (:3456)
+
+MonsieurMarket exposes a `/signal` endpoint that all sources POST to:
+
+```json
+{
+    "source": "bloomberg",
+    "type":   "ready|no_source|post|error",
+    "data":   { "title": "...", "timestamp_raw": "...", ... },
+    "ts":     1744030000
+}
+```
+
+This is the brain's single entry point. Future signal sources (Reuters, Twitter, etc.) plug in here without touching any other code.
 
 ---
 
@@ -242,11 +276,10 @@ python scripts/get_token_ids.py
 | Component | Model | When | Approx cost |
 |---|---|---|---|
 | Bloomberg tag picker | Haiku | Once per day | ~$0.00 |
-| Trump filter | Haiku | Per relevant post | ~$0.00 |
+| Trump filter | Haiku | Every Trump post (~few/day) | ~$0.00 |
 | Trump analysis | Sonnet + web search | Per relevant post | ~$0.02 |
-| RSS/Bloomberg filter | Haiku | Per poll cycle | ~$0.00 |
-| Signal analysis | Sonnet + web search | When signals present | ~$0.05 |
-| Weekly digest | Sonnet + web search | Sunday 9am | ~$0.05 |
+| Signal analysis | Sonnet + web search | When signals present (disabled) | ~$0.05 |
+| Weekly digest | Sonnet + web search | Sunday 9am (disabled) | ~$0.05 |
 
 ---
 
@@ -254,7 +287,7 @@ python scripts/get_token_ids.py
 
 Ask Claude to generate scheduled_events.json for the coming week:
 
-"Generate my MonsieurMarket scheduled_events.json for next week — include NFP, EIA inventory, any OPEC meetings, Fed speakers, and known geopolitical events relevant to Brent crude."
+> "Generate my MonsieurMarket scheduled_events.json for next week — include NFP, EIA inventory, any OPEC meetings, Fed speakers, and known geopolitical events relevant to Brent crude."
 
 Claude will search for current event dates and output a ready-to-paste JSON with calibrated settings per event type.
 
@@ -262,29 +295,20 @@ Claude will search for current event dates and output a ready-to-paste JSON with
 
 ## Roadmap
 
-### Done
-- [x] Git repo initialised
-- [x] Camoufox vs PerimeterX working
-- [x] Bloomberg monitor scraping liveblog and /latest/war-with-iran
-- [x] Bloomberg watcher plugged into MonsieurMarket
-- [x] Bloomberg on-demand refresh on price spike
-- [x] Polymarket extracted to polymarket/ module
-- [x] config.py extracted
-- [x] data/ folder for runtime state
-
 ### Near-term
+- [ ] ig/ folder — extract Brent price watcher and IG REST into ig/ module
+- [ ] monitor.py split — scrapers.py, navigation.py, source_finder.py
 - [ ] state.py — extract state management
-- [ ] sources/ — extract RSS, Trump, IG into modules
-- [ ] analysis/ — extract Haiku/Sonnet into modules
-- [ ] trade_logger.py — shared trade log module
+- [ ] Enable run_poll() with token budget
 - [ ] T+1 trade review — Sonnet post-mortem 24h after execution
 - [ ] IG live execution — real POST /positions/otc on IG demo then live
-- [ ] Enable run_poll() with token budget
+- [ ] Sonnet correlation — explain price move using Bloomberg posts
 
 ### Medium-term
 - [ ] ATR-based dynamic thresholds
 - [ ] Telegram command interface — /status /events /positions /close
 - [ ] Whale reputation scoring
+- [ ] Signal buffer in MM for run_poll() Bloomberg integration
 
 ### Later — Pi Migration
 - [ ] Move to Raspberry Pi (always-on)
@@ -296,24 +320,7 @@ Claude will search for current event dates and output a ready-to-paste JSON with
 - [ ] Multi-asset streaming — Thales, TotalEnergies
 - [ ] European Rearmament theme activation
 - [ ] X/Twitter monitoring ($100/month API tier)
-
----
-
-## .gitignore
-
-```
-.env
-data/
-venv/
-polymarket/market_relevance.json
-polymarket/polymarket_markets.json
-bloomberg_camoufox/bloomberg_session.json
-bloomberg_camoufox/bloomberg_feed.json
-bloomberg_camoufox/monitor_state.json
-bloomberg_camoufox/chrome_profile/
-__pycache__/
-*.pyc
-```
+- [ ] Additional signal sources via /signal API (Reuters live, FT, etc.)
 
 ---
 

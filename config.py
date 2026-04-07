@@ -47,6 +47,10 @@ CONFIG = {
         "time":    "09:00",
     },
 
+    # ── EXTERNAL API ENDPOINTS ───────────────────────────────────────────────────
+    "polymarket_data_api": "https://data-api.polymarket.com",
+    "polymarket_ws":       "wss://ws-subscriptions-clob.polymarket.com/ws/market",    
+
     # ── THEMES ───────────────────────────────────────────────────────────────
     "themes": [
         {

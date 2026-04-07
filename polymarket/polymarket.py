@@ -24,8 +24,8 @@ RELEVANCE_FILE  = Path(__file__).parent / "market_relevance.json"
 # ─────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────
-POLYMARKET_DATA_API  = "https://data-api.polymarket.com"
-POLYMARKET_WS        = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+POLYMARKET_DATA_API  = CONFIG["polymarket_data_api"]
+POLYMARKET_WS        = CONFIG["polymarket_ws"]
 WHALE_LEDGER_WINDOW_H = 24
 WHALE_REPEAT_TRIGGER  = 50000
 
