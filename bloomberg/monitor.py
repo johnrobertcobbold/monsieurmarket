@@ -748,6 +748,15 @@ def scrape_page(page, source_url: str, source_type: str) -> list[dict]:
 def _scrape_liveblog(page) -> list[dict]:
     scraped_at = datetime.now(timezone.utc)
 
+    # Check for "Live ended" badge before scraping posts
+    live_ended = page.evaluate("""() => {
+        const badges = Array.from(document.querySelectorAll('[class*="LiveblogStatus_badge"]'));
+        return badges.some(b => b.textContent?.toLowerCase().includes('live ended'));
+    }""") or False
+
+    if live_ended:
+        log.info("🔚 Liveblog 'Live ended' badge detected")
+
     raw = page.evaluate("""() => {
         return Array.from(
             document.querySelectorAll('.LiveblogPost_post__XXK17')
@@ -769,13 +778,17 @@ def _scrape_liveblog(page) -> list[dict]:
                 author:        byline?.textContent?.replace('By ', '').trim() || '',
                 source:        'Bloomberg Liveblog',
                 source_type:   'liveblog',
+                live_ended:    False,
             };
         }).filter(p => p.body);
     }""") or []
 
     for item in raw:
-        # datetime attribute is already ISO UTC — use directly, no parsing needed
         item['timestamp_approx'] = item['timestamp_raw'] or scraped_at.isoformat()
+
+    # Tag the first post with live_ended so browser_loop can detect it
+    if live_ended and raw:
+        raw[0]['live_ended'] = True
 
     return raw
 
@@ -941,6 +954,24 @@ def browser_loop():
                 # Signal MM for each new post — MM decides what to do with them
                 for post in new_posts:
                     signal_mm('post', post)
+
+                save_session_cookies(_context)
+
+                # Check if liveblog has ended — reset source so we go back to homepage
+                if source_type == 'liveblog':
+                    live_ended = any(p.get('live_ended') for p in posts)
+                    if live_ended:
+                        log.info("🔚 Liveblog ended — resetting source, will scan homepage next cycle")
+                        signal_mm('liveblog_ended', {
+                            'source_url': source_url,
+                            'msg':        'Liveblog ended — switching to tag source',
+                        })
+                        update_state(
+                            source_type=None,
+                            source_url=None,
+                            status='searching',
+                        )
+                        continue
 
                 save_session_cookies(_context)
 

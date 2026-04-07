@@ -39,7 +39,7 @@ run.sh
         │
         ├── MM Signal API :3456   <- /signal endpoint, all sources POST here
         │
-        ├── bloomberg_camoufox/
+        ├── bloomberg/
         │     └── monitor.py      <- Camoufox browser, Flask :3457
         │                            NO internal timer — waits for MM /refresh calls
         │                            POSTs signals back to MM on new posts
@@ -86,7 +86,7 @@ monsieurmarket/
 ├── rss_sources.json              <- curated RSS feeds
 ├── run.sh                        <- start script (starts MM which starts monitor)
 │
-├── bloomberg_camoufox/           <- Bloomberg scraping layer
+├── bloomberg/           <- Bloomberg scraping layer
 │   ├── monitor.py                <- Camoufox browser + Flask API :3457
 │   └── setup.py                  <- one-time headful login
 │   (gitignored: bloomberg_session.json, bloomberg_feed.json, monitor_state.json)
@@ -146,7 +146,7 @@ IG_BRENT_EPIC=CC.D.LCO.OPTCALL.IP
 ### 4. Bloomberg one-time setup
 
 ```bash
-python bloomberg_camoufox/setup.py
+python bloomberg/setup.py
 # browser opens, log in to Bloomberg manually
 # session saved automatically
 ```

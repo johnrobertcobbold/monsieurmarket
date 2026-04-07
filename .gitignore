@@ -10,10 +10,10 @@ polymarket/market_relevance.json
 polymarket/polymarket_markets.json
 
 # ── bloomberg ────────────────────────────────
-bloomberg_camoufox/monitor_state.json
-bloomberg_camoufox/bloomberg_feed.json
-bloomberg_camoufox/bloomberg_session.json
-bloomberg_camoufox/chrome_profile/
+bloomberg/monitor_state.json
+bloomberg/bloomberg_feed.json
+bloomberg/bloomberg_session.json
+bloomberg/chrome_profile/
 
 # ── old paths (keep for safety) ──────────────
 monsieur_market_state.json

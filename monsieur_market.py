@@ -801,6 +801,15 @@ def _handle_bloomberg_signal(stype: str, data: dict):
         log.info("Bloomberg: no source — scheduler will retry")
         bloomberg_scheduler.on_no_source()
 
+    elif stype == 'liveblog_ended':
+        log.info("Bloomberg: liveblog ended — monitor will scan homepage next cycle")
+        bloomberg_scheduler.on_no_source()
+        send_message(
+            "📰 <b>Bloomberg liveblog ended</b>\n"
+            "Switching back to tag source — monitor scanning homepage.\n"
+            f"⏰ {datetime.now().strftime('%d/%m %H:%M')}"
+        )
+
     elif stype == 'post':
         # New post — send to Telegram immediately.
         # Brain logic here later: score, correlate with price/whales, etc.
@@ -1319,7 +1328,7 @@ def start_bloomberg_monitor():
     global _monitor_proc
     import subprocess
 
-    cmd = [sys.executable, 'bloomberg_camoufox/monitor.py']
+    cmd = [sys.executable, 'bloomberg/monitor.py']
     if '--visible' in sys.argv:
         cmd.append('--visible')
         log.info("🦊 Starting Bloomberg monitor (headful)...")

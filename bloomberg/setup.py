@@ -1,4 +1,4 @@
-# bloomberg_camoufox/setup.py
+# bloomberg/setup.py
 import json
 import time
 from pathlib import Path
