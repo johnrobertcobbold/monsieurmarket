@@ -4,7 +4,7 @@ MonsieurMarket — Personal Trading Intelligence Bot
 Monitors geopolitical signals and whale trades, alerts via Telegram.
 
 Setup:
-    pip install anthropic requests schedule python-dotenv
+    pip install anthropic requests schedule python-dotenv flask
 
 Environment variables required:
     ANTHROPIC_API_KEY   — your Anthropic key
@@ -19,6 +19,7 @@ import os
 import json
 import time
 import logging
+import random
 import schedule
 import requests
 import threading
@@ -34,6 +35,7 @@ Path("data/trades").mkdir(exist_ok=True)
 from scheduled_event_watcher import ScheduledEventWatcher
 from config import CONFIG
 from telegram_client import send_message, format_bloomberg_post
+from trumpstruth import start_trump_watcher
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -427,7 +429,7 @@ def format_alert(
     if ig_block:
         lines.append(ig_block)
 
-    lines.append(f"\n⏰ {datetime.now().strftime('%d/%m %H:%M')} Paris")
+    lines.append(f"\n⏰ {datetime.now().strftime('%d/%m %H:%M')}")
     return "\n".join(lines)
 
 
@@ -630,13 +632,12 @@ def _on_brent_tick(ticker):
         f"{alert_emoji} <b>MonsieurMarket — Price Alert</b>\n\n"
         f"{alert_reason}\n\n"
         f"{price_line}{range_line}"
-        f"\n⏰ {now_str} Paris"
+        f"\n⏰ {now_str}"
     )
     _price_state.mark_alerted()
     log.info(f"Price alert sent — {alert_reason[:60]}")
 
     # Brent moved — ask Bloomberg monitor to scrape immediately
-    # New posts will arrive as /signal calls and be sent to Telegram
     bloomberg_scheduler.trigger_now(reason=alert_reason[:60])
 
 
@@ -648,10 +649,10 @@ class BloombergScheduler:
     MM-owned timer that decides when to ask monitor to scrape.
     Monitor has no internal timer — this is the brain's schedule.
 
-    Refresh intervals (market-hours aware):
-        08:00–22:00 UTC — every 5 min
-        06:00–08:00 UTC — every 15 min
-        22:00–06:00 UTC — every 60 min (overnight)
+    Refresh intervals (French market hours, hardcoded UTC offsets for CEST):
+        06:00–20:00 UTC (08:00–22:00 Paris) — every ~5 min
+        04:00–06:00 UTC (06:00–08:00 Paris) — every ~15 min
+        else                                 — every 60 min overnight
 
     Immediate refresh triggered by:
         - Brent price spike
@@ -708,12 +709,11 @@ class BloombergScheduler:
 
     def _do_refresh(self):
         """
-        POST /refresh to monitor.
+        GET /refresh on monitor.
         New posts come back as POST /signal calls — no polling needed.
 
         TODO: Sonnet correlation on price spike
-        When _do_refresh is called with a price spike context, pass that
-        context here so the /signal handler can correlate news with the move.
+        Pass price context here so /signal handler can correlate news with the move.
         """
         try:
             log.info("Bloomberg scheduler: calling /refresh on monitor...")
@@ -727,10 +727,15 @@ class BloombergScheduler:
                 self._schedule_next()
 
     def _interval_sec(self) -> int:
+        """
+        Market-hours aware interval.
+        Hardcoded for CEST (UTC+2) — covers April-October.
+        Paris 08:00-22:00 = UTC 06:00-20:00
+        """
         hour = datetime.now(timezone.utc).hour
-        if   8 <= hour < 22: return  5 * 60
-        elif 6 <= hour < 8:  return 15 * 60
-        else:                return 60 * 60
+        if   6 <= hour < 20: return  5 * 60 + random.randint(-30, 90)  # market hours
+        elif 4 <= hour < 6:  return 15 * 60 + random.randint(-60, 60)  # pre-market
+        else:                return 60 * 60                              # overnight
 
 
 bloomberg_scheduler = BloombergScheduler()
@@ -792,8 +797,8 @@ def _handle_signal(source: str, stype: str, data: dict):
         if source == 'bloomberg':
             _handle_bloomberg_signal(stype, data)
         # Future sources plug in here:
-        # elif source == 'price':     _handle_price_signal(stype, data)
-        # elif source == 'trump':     _handle_trump_signal(stype, data)
+        # elif source == 'price':      _handle_price_signal(stype, data)
+        # elif source == 'ukmto':      _handle_ukmto_signal(stype, data)
         # elif source == 'polymarket': _handle_polymarket_signal(stype, data)
     except Exception as e:
         log.error(f"Signal handler error ({source}/{stype}): {e}")
@@ -803,18 +808,18 @@ def _handle_bloomberg_signal(stype: str, data: dict):
     """Handle signals from the Bloomberg monitor."""
 
     if stype == 'ready':
-        # Monitor found a source and is ready to scrape on demand
         src  = data.get('source_type', '?')
         url  = data.get('source_url', '')[:70]
         log.info(f"Bloomberg ready: {src} — {url}")
         bloomberg_scheduler.on_ready()
 
     elif stype == 'no_source':
-        # Monitor couldn't find a liveblog or tag — scheduler will retry
         log.info("Bloomberg: no source — scheduler will retry")
         bloomberg_scheduler.on_no_source()
 
     elif stype == 'post':
+        # New post — send to Telegram immediately.
+        # Brain logic here later: score, correlate with price/whales, etc.
         log.info(f"Bloomberg post: {data.get('title', '')[:60]}")
         send_message(format_bloomberg_post(data))
 
@@ -1053,7 +1058,7 @@ def _polymarket_ws_worker():
                     f"{direction} <b>${amount:,.0f}</b> @ {price:.2f}\n"
                     f"Market: {label}"
                     f"{trade_time_str}\n"
-                    f"\n⏰ {now_str} Paris"
+                    f"\n⏰ {now_str}"
                 )
 
                 if repeat_alerts:
@@ -1101,153 +1106,6 @@ def start_polymarket_ws():
     t = threading.Thread(target=_polymarket_ws_worker, name="PolymarketWS", daemon=True)
     t.start()
     log.info("Polymarket WS thread started")
-
-
-# ─────────────────────────────────────────────
-# TRUMP WATCHER
-# ─────────────────────────────────────────────
-TRUMP_RSS = "https://trumpstruth.org/feed"
-
-
-def _fetch_trump_posts() -> list[dict]:
-    try:
-        import re
-        r = requests.get(TRUMP_RSS, timeout=8, headers={
-            "User-Agent": "Mozilla/5.0 (compatible; MonsieurMarket/1.0)"
-        })
-        r.raise_for_status()
-        items = re.findall(r"<item>(.*?)</item>", r.text, re.DOTALL)
-        posts = []
-        for item in items[:10]:
-            title_m = re.search(r"<title><!\[CDATA\[(.*?)\]\]></title>", item, re.DOTALL)
-            link_m  = re.search(r"<link>(.*?)</link>", item)
-            title   = title_m.group(1).strip() if title_m else ""
-            url     = link_m.group(1).strip()  if link_m  else ""
-            if title and url:
-                posts.append({"url": url, "title": title})
-        return posts
-    except Exception as e:
-        log.debug(f"Trump RSS fetch error: {e}")
-        return []
-
-
-def _haiku_trump_filter(post: dict) -> bool:
-    """
-    Haiku decides if a Trump post is relevant to oil/Iran/geopolitics.
-    No keyword pre-filter — Trump often signals obliquely
-    (e.g. 'a civilization will die tonight' = Iran strike context).
-    Haiku calls are cheap and Trump posts are infrequent (~few per day).
-    """
-    try:
-        client   = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=10,
-            messages=[{"role": "user", "content":
-                f"Does this Trump post relate to oil prices, Iran, Saudi Arabia, "
-                f"OPEC, Middle East conflict, energy markets, or military action?\n\n"
-                f'"{post["title"]}"\n\n'
-                f"Reply YES or NO only."
-            }],
-        )
-        return response.content[0].text.strip().upper().startswith("YES")
-    except Exception as e:
-        log.debug(f"Haiku Trump filter error: {e}")
-        return False
-
-
-def _sonnet_analyze_trump(post: dict) -> str | None:
-    try:
-        client      = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-        themes_text = ", ".join(t["name"] for t in CONFIG["themes"] if t.get("active"))
-        response    = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=600,
-            messages=[{"role": "user", "content":
-                f"Trump just posted on Truth Social:\n\n"
-                f'"{post["title"]}"\n\n'
-                f"Active trading themes: {themes_text}\n"
-                f"The trader is long Brent crude (knock-out turbo) and long Thales.\n\n"
-                f"In 4-5 sentences max: what does this post imply for Brent crude price? "
-                f"Bullish or bearish and why? What 2 things should the trader watch next? "
-                f"Be direct and specific — no fluff. No markdown headers."
-            }],
-            tools=[{
-                "type": "web_search_20260209",
-                "name": "web_search",
-                "max_uses": 2,
-            }],
-        )
-        text_blocks = [
-            block.text for block in response.content
-            if hasattr(block, "text") and block.text and block.text.strip()
-        ]
-        return " ".join(text_blocks).strip() or None
-    except Exception as e:
-        log.warning(f"Sonnet Trump analysis error: {e}")
-        return None
-
-
-def _trump_watcher_worker():
-    log.info("Trump watcher started — polling every 2 min")
-    POLL_INTERVAL = 120
-
-    while True:
-        try:
-            state     = load_state()
-            last_seen = state.get("trump_last_seen_url")
-            posts     = _fetch_trump_posts()
-
-            if not posts:
-                time.sleep(POLL_INTERVAL)
-                continue
-
-            new_posts = []
-            for post in posts:
-                if post["url"] == last_seen:
-                    break
-                new_posts.append(post)
-
-            if not new_posts:
-                log.debug("Trump watcher: no new posts")
-                time.sleep(POLL_INTERVAL)
-                continue
-
-            log.info(f"Trump watcher: {len(new_posts)} new post(s)")
-
-            # Persist last seen immediately — avoids reprocessing on restart
-            state["trump_last_seen_url"] = posts[0]["url"]
-            save_state(state)
-
-            for post in new_posts:
-                log.info(f"Trump post: {post['title'][:80]}")
-
-                if not _haiku_trump_filter(post):
-                    log.info("  → not relevant — skipping")
-                    continue
-
-                log.info("  → RELEVANT — firing Sonnet analysis")
-                analysis = _sonnet_analyze_trump(post)
-
-                if analysis:
-                    send_message(
-                        f"🇺🇸 <b>MonsieurMarket — Trump Alert</b>\n\n"
-                        f"<i>{post['title'][:300]}</i>\n\n"
-                        f"🧠 <b>Sonnet:</b> {analysis}\n\n"
-                        f"⏰ {datetime.now().strftime('%d/%m %H:%M')} Paris"
-                    )
-                    log.info("  → Trump alert sent")
-
-        except Exception as e:
-            log.error(f"Trump watcher error: {e}")
-
-        time.sleep(POLL_INTERVAL)
-
-
-def start_trump_watcher():
-    t = threading.Thread(target=_trump_watcher_worker, name="TrumpWatcher", daemon=True)
-    t.start()
-    log.info("Trump watcher thread started")
 
 
 # ─────────────────────────────────────────────
@@ -1434,7 +1292,7 @@ def format_repeat_whale_alert(alerts: list, market: str = "") -> str | None:
         )
     if market:
         lines.append(f"\nMarket: {market}")
-    lines.append(f"\n⏰ {datetime.now().strftime('%d/%m %H:%M')} Paris")
+    lines.append(f"\n⏰ {datetime.now().strftime('%d/%m %H:%M')}")
     return "\n".join(lines)
 
 
@@ -1467,7 +1325,7 @@ def _run_portfolio_check(trader: str, proxy_wallet: str):
         for m in new_relevant:
             lines.append(f"  • <b>{m['title']}</b>")
             lines.append(f"    {m['reason']}  |  whale position: ${m['whale_amount']:,.0f} {m['direction']}")
-        lines.append(f"\n⏰ {datetime.now().strftime('%d/%m %H:%M')} Paris")
+        lines.append(f"\n⏰ {datetime.now().strftime('%d/%m %H:%M')}")
         send_message("\n".join(lines))
         log.info(f"Portfolio check for {trader}: {len(new_relevant)} new relevant market(s)")
     except Exception as e:
@@ -1475,16 +1333,13 @@ def _run_portfolio_check(trader: str, proxy_wallet: str):
 
 
 def fetch_rss_headlines(state: dict) -> tuple[list[dict], dict]:
-    """
-    Fetch recent headlines from free RSS feeds.
-    Filters out already-seen URLs.
-    """
+    """Fetch recent headlines from free RSS feeds. Filters out already-seen URLs."""
     sources = [
-        {"name": "Reuters",   "url": "https://feeds.reuters.com/reuters/topNews"},
-        {"name": "Al Jazeera","url": "https://www.aljazeera.com/xml/rss/all.xml"},
-        {"name": "OilPrice",  "url": "https://oilprice.com/rss/main"},
-        {"name": "CNBC",      "url": "https://www.cnbc.com/id/100003114/device/rss/rss.html"},
-        {"name": "CNN",       "url": "http://rss.cnn.com/rss/cnn_latest.rss"},
+        {"name": "Reuters",    "url": "https://feeds.reuters.com/reuters/topNews"},
+        {"name": "Al Jazeera", "url": "https://www.aljazeera.com/xml/rss/all.xml"},
+        {"name": "OilPrice",   "url": "https://oilprice.com/rss/main"},
+        {"name": "CNBC",       "url": "https://www.cnbc.com/id/100003114/device/rss/rss.html"},
+        {"name": "CNN",        "url": "http://rss.cnn.com/rss/cnn_latest.rss"},
     ]
     headlines = []
     for source in sources:
@@ -1517,7 +1372,6 @@ def run_poll():
     state = load_state()
     state = clean_state(state)
 
-    # ── Step 0: Fetch live Brent price from IG (always, best-effort) ──
     ig_data = check_ig_brent()
 
     if ig_data and ig_data.get("barrier_warning"):
@@ -1527,15 +1381,13 @@ def run_poll():
             f"only {ig_data['barrier_distance_pct']:.1f}% away\n"
             f"Current mid: {ig_data['mid']:.2f}  "
             f"({ig_data['net_chg_pct']:+.2f}% today)\n"
-            f"⏰ {datetime.now().strftime('%d/%m %H:%M')} Paris"
+            f"⏰ {datetime.now().strftime('%d/%m %H:%M')}"
         )
 
-    # ── Step 1: Fetch Polymarket whale trades ──
     whale_signals, state = check_polymarket(state)
     if whale_signals:
         log.info(f"Polymarket: {len(whale_signals)} new whale signal(s)")
 
-    # ── Step 1b: Aggregate and check for standalone whale trigger ──
     whale_agg_global     = aggregate_whale_signals(
         [s for s in whale_signals if s.get("type") == "whale_trade"]
     )
@@ -1568,9 +1420,8 @@ def run_poll():
                 whale_trigger_reason = f"${total:,.0f} total, {net/total*100:.0f}% {direction}"
 
     if whale_flow_trigger:
-        log.info(f"🐋 Whale trigger: {whale_trigger_reason} — Sonnet will fire even without news")
+        log.info(f"🐋 Whale trigger: {whale_trigger_reason}")
 
-    # ── Step 1c: Update whale ledger and check for repeat whales ──
     state, repeat_whale_alerts = update_whale_ledger(state, whale_signals)
     if repeat_whale_alerts:
         msg = format_repeat_whale_alert(repeat_whale_alerts, market="US forces enter Iran")
@@ -1590,8 +1441,6 @@ def run_poll():
                     daemon=True,
                 ).start()
 
-    # ── Step 2: Fetch RSS headlines ──
-    # Skip if polled recently — UNLESS a price or whale trigger is active
     poll_interval_sec = CONFIG["poll_interval_minutes"] * 60
     time_since_last   = time.time() - state.get("last_news_poll", 0)
     force_news        = whale_flow_trigger or bool(
@@ -1600,8 +1449,6 @@ def run_poll():
     )
 
     if time_since_last < poll_interval_sec and not force_news:
-        mins_remaining = int((poll_interval_sec - time_since_last) / 60)
-        log.info(f"RSS: skipping — next poll in {mins_remaining} min")
         all_headlines = []
     else:
         if force_news and time_since_last < poll_interval_sec:
@@ -1610,44 +1457,30 @@ def run_poll():
         state["last_news_poll"] = time.time()
         log.info(f"RSS: {len(all_headlines)} new headlines")
 
-    # ── Step 2.5: Bloomberg headlines from signal buffer ──
-    # When run_poll() is re-enabled, Bloomberg posts will already be in
-    # MM's signal buffer (received via /signal endpoint) — no fetch needed.
-    # TODO: implement signal buffer and use it here instead of fetching.
+    # Bloomberg posts arrive via /signal — no fetch needed here
+    # TODO: implement signal buffer for run_poll() integration
     bloomberg_headlines = []
 
-    # ── Step 3: Per-theme processing ──
     for theme in CONFIG["themes"]:
         if not theme.get("active"):
             continue
 
         theme_name         = theme["name"]
-        log.info(f"Processing theme: {theme_name}")
-
         relevant_headlines = haiku_filter_news(all_headlines, theme)
-        log.info(f"  Haiku filtered: {len(relevant_headlines)} relevant headlines")
 
         if not relevant_headlines and not whale_flow_trigger:
-            log.info(f"  No signals for {theme_name} — skipping Sonnet")
             continue
-        if not relevant_headlines and whale_flow_trigger:
-            log.info(f"  No news but whale flow triggered — running Sonnet on whale data")
 
-        # ── Step 4: Sonnet deep analysis ──
         analysis = sonnet_analyze(relevant_headlines, whale_signals, theme)
         if not analysis:
             continue
 
         score = analysis.get("score", 0)
-        log.info(f"  Sonnet score: {score}/10")
-
         if score < CONFIG["alert_threshold"]:
-            log.info(f"  Score {score} below threshold — no alert")
             for h in relevant_headlines:
                 state["seen_news_urls"][h["url"]] = time.time()
             continue
 
-        # ── Step 5: Format and send alert ──
         trigger_parts = []
         if relevant_headlines:
             trigger_parts.append(f"{len(relevant_headlines)} news signal(s)")
@@ -1660,7 +1493,6 @@ def run_poll():
             trigger_reason=trigger_str,
         )
         send_message(message)
-        log.info(f"  Alert sent for {theme_name}")
 
         for h in relevant_headlines:
             state["seen_news_urls"][h["url"]] = time.time()
@@ -1729,7 +1561,7 @@ def main():
     # Start MM Signal API first so monitor can POST /signal on startup
     start_mm_api()
 
-    # Now launch the monitor — it will signal MM when ready
+    # Launch monitor — it will signal MM when ready
     start_bloomberg_monitor()
 
     send_message(
@@ -1760,7 +1592,6 @@ def main():
             schedule.run_pending()
             time.sleep(30)
     finally:
-        # Clean up monitor subprocess on exit
         if _monitor_proc:
             log.info("Stopping Bloomberg monitor...")
             _monitor_proc.terminate()
