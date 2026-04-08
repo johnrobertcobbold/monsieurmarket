@@ -706,8 +706,8 @@ class BloombergScheduler:
         except Exception as e:
             log.warning(f"Bloomberg scheduler: /refresh failed: {e}")
         finally:
-            if self._ready:
-                self._schedule_next()
+            log.info(f"Bloomberg scheduler: _do_refresh finally — _ready={self._ready}")
+            self._schedule_next()
 
     def _interval_sec(self) -> int:
         """

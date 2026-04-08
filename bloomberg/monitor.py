@@ -982,16 +982,18 @@ def browser_loop():
                         last_refresh = state.get('last_refresh')
 
                     should_check = True
+                    check_interval  = 15 if 6 <= hour < 20 else 60
                     if last_refresh:
                         try:
-                            last_dt    = datetime.fromisoformat(last_refresh)
-                            mins_since = (datetime.now(timezone.utc) - last_dt).total_seconds() / 60
-                            should_check = mins_since >= 60
+                            last_dt         = datetime.fromisoformat(last_refresh)
+                            mins_since      = (datetime.now(timezone.utc) - last_dt).total_seconds() / 60
+                            hour            = datetime.now(timezone.utc).hour
+                            should_check    = mins_since >= check_interval
                         except Exception:
                             pass
 
                     if should_check:
-                        log.info("🔍 Hourly liveblog check...")
+                        log.info(f"🔍 Liveblog check (every {check_interval}min)...")
                         liveblog = find_liveblog_on_homepage(_page, today)
                         if liveblog:
                             log.info("🎉 Liveblog appeared — switching!")
@@ -1114,11 +1116,17 @@ def refresh():
         _refresh_event.set()
 
         deadline = time.time() + 30
+        scraper_responded = False
         while time.time() < deadline:
             time.sleep(0.5)
             with state_lock:
                 if state.get('last_refresh') and state.get('last_refresh') != before_refresh:
+                    log.info("⚡ Refresh complete — scraper responded")
+                    scraper_responded = True                    
                     break
+
+        if not scraper_responded:
+            log.warning("⚡ Refresh timed out — scraper did not respond in 30s ⚠️")
 
         with state_lock:
             new_count = max(0, state['post_count'] - before_count)

@@ -14,6 +14,7 @@ bloomberg/monitor_state.json
 bloomberg/bloomberg_feed.json
 bloomberg/bloomberg_session.json
 bloomberg/chrome_profile/
+bloomberg/liveblog_history.json
 
 # ── old paths (keep for safety) ──────────────
 monsieur_market_state.json
