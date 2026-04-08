@@ -525,6 +525,7 @@ def find_liveblog_on_homepage(page, date: str) -> str | None:
         else:
             log.info("🔍 No liveblogs found on homepage at all")
 
+        # today first
         link = next(
             (lb['href'] for lb in all_liveblogs if date in lb['href']),
             None
@@ -532,10 +533,21 @@ def find_liveblog_on_homepage(page, date: str) -> str | None:
 
         if link:
             log.info(f"✅ Today's liveblog selected: {link}")
-        else:
-            log.info(f"📰 No liveblog for {date} on homepage")
+            return link
 
-        return link
+        # yesterday's liveblog still featured on homepage = still active
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime('%Y-%m-%d')
+        link = next(
+            (lb['href'] for lb in all_liveblogs if yesterday in lb['href']),
+            None
+        )
+
+        if link:
+            log.info(f"📰 Using yesterday's liveblog — still featured on homepage: {link}")
+            return link
+
+        log.info(f"📰 No liveblog found on homepage")
+        return None
 
     except Exception as e:
         log_error(f"Homepage scan failed: {e}")
@@ -745,18 +757,41 @@ def scrape_page(page, source_url: str, source_type: str) -> list[dict]:
         log_error(f"Scrape failed ({source_type}): {e}")
         return []
 
+def _check_liveblog_still_active(page) -> tuple[bool, str]:
+    """
+    Returns (is_active, last_updated_text)
+    - is_active = False if badge != 'Live' OR last updated > 1hr ago
+    """
+    try:
+        result = page.evaluate("""() => {
+            const badge = document.querySelector('[class*="LiveblogStatus_badge"]');
+            const badgeText = badge?.textContent?.trim() || '';
+
+            const timeEl = document.querySelector('[class*="LiveblogStatus_timestamp"] time');
+            const datetime = timeEl?.getAttribute('datetime') || '';
+            const updatedText = timeEl?.textContent?.trim() || '';
+
+            return { badgeText, datetime, updatedText };
+        }""")
+
+        # badge must say "Live"
+        if result['badgeText'].lower() != 'live':
+            return False, result['badgeText']
+
+        # check datetime freshness
+        if result['datetime']:
+            last_updated = datetime.fromisoformat(result['datetime'].replace('Z', '+00:00'))
+            mins_ago = (datetime.now(timezone.utc) - last_updated).total_seconds() / 60
+            if mins_ago >= 60:
+                return False, f"last updated {mins_ago:.0f}min ago"
+
+        return True, result['updatedText']
+
+    except Exception:
+        return True, ''
 
 def _scrape_liveblog(page) -> list[dict]:
     scraped_at = datetime.now(timezone.utc)
-
-    # Check for "Live ended" badge before scraping posts
-    live_ended = page.evaluate("""() => {
-        const badges = Array.from(document.querySelectorAll('[class*="LiveblogStatus_badge"]'));
-        return badges.some(b => b.textContent?.toLowerCase().includes('live ended'));
-    }""") or False
-
-    if live_ended:
-        log.info("🔚 Liveblog 'Live ended' badge detected")
 
     raw = page.evaluate("""() => {
         return Array.from(
@@ -779,17 +814,12 @@ def _scrape_liveblog(page) -> list[dict]:
                 author:        byline?.textContent?.replace('By ', '').trim() || '',
                 source:        'Bloomberg Liveblog',
                 source_type:   'liveblog',
-                live_ended:    False,
             };
         }).filter(p => p.body);
     }""") or []
 
     for item in raw:
         item['timestamp_approx'] = item['timestamp_raw'] or scraped_at.isoformat()
-
-    # Tag the first post with live_ended so browser_loop can detect it
-    if live_ended and raw:
-        raw[0]['live_ended'] = True
 
     return raw
 
@@ -950,18 +980,14 @@ def browser_loop():
                     save_session_cookies(_context)
 
                     if source_type == 'liveblog':
-                        live_ended = any(p.get('live_ended') for p in posts)
-                        if live_ended:
-                            log.info("🔚 Liveblog ended — resetting source, will scan homepage next cycle")
+                        is_active, updated_text = _check_liveblog_still_active(_page)
+                        if not is_active:
+                            log.info(f"🔚 Liveblog inactive ({updated_text}) — back to homepage")
                             signal_mm('liveblog_ended', {
                                 'source_url': source_url,
-                                'msg':        'Liveblog ended — switching to tag source',
+                                'msg': f'Liveblog inactive: {updated_text}',
                             })
-                            update_state(
-                                source_type=None,
-                                source_url=None,
-                                status='searching',
-                            )
+                            update_state(source_type=None, source_url=None, status='searching')
                             continue
 
                     save_session_cookies(_context)
