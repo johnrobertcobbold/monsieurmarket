@@ -1,148 +1,3 @@
-# 🎩 MonsieurMarket
-
-Personal geopolitical trading intelligence bot. Monitors Brent crude price, Bloomberg liveblogs, news signals, Trump posts, and Polymarket whale trades. Alerts via Telegram.
-
-Built on Anthropic Claude (Haiku for filtering, Sonnet for analysis) + Camoufox for Bloomberg scraping.
-
----
-
-## What It Does
-
-### Real-time (sub-second)
-- **Brent price stream** via IG Lightstreamer — fires on 5min/10min/day-open moves
-- **Polymarket websocket** — whale trades ($10k+) tracked in real-time, instant alert >$100k
-- **Bloomberg on-demand** — triggered automatically on Brent price alerts, fetches fresh context via scheduler
-
-### Near real-time
-- **Trump watcher** — polls trumpstruth.org/feed every 2 min, Haiku filters (no keyword pre-filter — oblique posts handled), Sonnet analyses relevant posts immediately
-- **Bloomberg monitor** — scrapes Bloomberg liveblog or best In Focus tag on a market-hours-aware schedule (5 min during 08-22 UTC, 15 min pre-market, 60 min overnight). MM owns the schedule, monitor is purely reactive.
-
-### Scheduled event monitoring
-- **Event watcher** — hot-reloadable scheduled_events.json defines known events (NFP, OPEC, speeches)
-- Arms at event start, watches for price move, confirms over N minutes, fires simulated order
-- **RSS fetch at open** — fetches curated RSS feeds X minutes after event opens
-- **Post-execution web search** — Haiku web search fires X minutes after simulated order
-- **Trade log** — every stage logged to data/trades/YYYY-MM-DD_eventid.md
-
-### Whale intelligence
-- Polymarket whale ledger tracks cumulative 24h flow per pseudonym
-- Alerts at every $50k band crossed
-- Three trigger types: single trade >$50k, single trader >$75k, net directional flow >$150k at 70%+ one-way
-
----
-
-## Architecture
-
-```
-run.sh
-  └── monsieur_market.py          <- brain, orchestrator, signal router
-        │
-        ├── MM Signal API :3456   <- /signal endpoint, all sources POST here
-        │
-        ├── bloomberg/
-        │     └── monitor.py      <- Camoufox browser, Flask :3457
-        │                            NO internal timer — waits for MM /refresh calls
-        │                            POSTs signals back to MM on new posts
-        │
-        ├── polymarket/
-        │     └── polymarket.py   <- trades, ledger, websocket
-        │
-        ├── scheduled_event_watcher.py  <- event windows, trade logs
-        └── config.py                   <- all configuration
-```
-
-### Signal flow
-
-```
-monitor.py      →  POST /signal {source: bloomberg, type: ready|post|error}
-                →  MM receives, BloombergScheduler starts, Telegram sent
-
-Brent spike     →  BloombergScheduler.trigger_now()
-                →  GET /refresh on monitor
-                →  monitor scrapes, POSTs new posts as signals
-                →  MM sends to Telegram
-
-Trump post      →  Haiku filter (no keyword pre-check)
-                →  Sonnet + web search analysis
-                →  Telegram alert
-```
-
-### Telegram responsibility
-All Telegram messages originate from `monsieur_market.py` via `telegram_client.py`.
-Monitor never sends Telegram directly — it signals MM, MM decides.
-
----
-
-## Folder Structure
-
-```
-monsieurmarket/
-├── .env                          <- secrets, never commit
-├── config.py                     <- all configuration + themes
-├── monsieur_market.py            <- main entry point + brain
-├── telegram_client.py            <- single place for all Telegram messaging
-├── scheduled_event_watcher.py    <- event monitoring
-├── scheduled_events.json         <- hot-reloadable event definitions
-├── rss_sources.json              <- curated RSS feeds
-├── run.sh                        <- start script (starts MM which starts monitor)
-│
-├── bloomberg/           <- Bloomberg scraping layer
-│   ├── monitor.py                <- Camoufox browser + Flask API :3457
-│   └── setup.py                  <- one-time headful login
-│   (gitignored: bloomberg_session.json, bloomberg_feed.json, monitor_state.json)
-│
-├── polymarket/                   <- Polymarket intelligence
-│   ├── polymarket.py             <- trades, ledger, websocket
-│   ├── check_whale_portfolio.py  <- portfolio analysis
-│   (gitignored: polymarket_markets.json, market_relevance.json)
-│
-├── data/                         <- gitignored, runtime state
-│   ├── monsieur_market_state.json
-│   ├── monsieur_market.log
-│   └── trades/                   <- markdown trade logs per event
-│
-├── scripts/                      <- one-off setup utilities
-│   ├── find_epic.py              <- find IG instrument epics
-│   ├── find_polymarket.py        <- search Polymarket markets
-│   └── get_token_ids.py          <- get yes/no token IDs
-│
-└── venv/                         <- gitignored, Python virtualenv
-```
-
----
-
-## Setup
-
-### 1. Clone and create virtualenv
-
-```bash
-git clone <your-repo>
-cd monsieurmarket
-/opt/homebrew/bin/python3 -m venv venv
-source venv/bin/activate
-```
-
-### 2. Install dependencies
-
-```bash
-pip install anthropic requests schedule python-dotenv flask camoufox playwright
-python -m camoufox fetch
-```
-
-### 3. Create .env
-
-```
-ANTHROPIC_API_KEY=sk-ant-your-key-here
-TELEGRAM_BOT_TOKEN=7123456789:AAF-your-token-here
-TELEGRAM_CHAT_ID=your-chat-id-here
-
-IG_USERNAME=your-ig-username
-IG_PASSWORD=your-ig-password
-IG_API_KEY=your-ig-api-key
-IG_ACC_NUMBER=your-ig-account-number
-IG_BRENT_EPIC=CC.D.LCO.OPTCALL.IP
-```
-
 ### 4. Bloomberg one-time setup
 
 ```bash
@@ -203,6 +58,54 @@ MonsieurMarket exposes a `/signal` endpoint that all sources POST to:
 ```
 
 This is the brain's single entry point. Future signal sources (Reuters, Twitter, etc.) plug in here without touching any other code.
+
+---
+
+## Telegram Commands
+
+| Command | Description |
+|---|---|
+| `/straddle` | Open straddle with default notional + barrier |
+| `/straddle 500` | Open straddle, 500€ per leg |
+| `/straddle 500 4` | Open straddle, 500€ per leg, 4% barrier distance |
+| `/status` | Show open positions + P&L (TODO) |
+| `/pause` | Pause automated alerts |
+| `/resume` | Resume automated alerts |
+| `/help` | Show available commands |
+
+### Straddle flow
+1. Bot checks barrier availability at requested % distance
+2. Bot fetches real EUR cost per leg via IG costs API
+3. If cost > notional → rejects with suggestion e.g. `Try: /straddle 420 4`
+4. Places call + put legs simultaneously (TODO) or sequentially
+5. Verifies both positions opened via internal IG positions API
+6. Sends confirmation with KO levels, distances, real costs
+
+---
+
+## IG Knockout Trading
+
+### API notes
+IG's public REST API does not support knockout order placement on demo accounts. MonsieurMarket uses IG's internal web platform API (reverse-engineered from browser network traffic):
+
+| Action | Endpoint |
+|---|---|
+| Market details + quoteId + barrier levels | `{api_base}/nwtpdeal/v3/markets/details` |
+| Place order | `{deal_base}/nwtpdeal/v3/orders/positions/otc` |
+| Verify positions | `{deal_base}/nwtpdeal/wtp/orders/positions` |
+| Cost estimate | `{deal_base}/dealing-gateway/costsandcharges/{acc}/open` |
+
+Required header: `x-device-user-agent: vendor=IG Group | applicationType=ig | platform=WTP | version=...`
+
+### Account setup
+IG has separate accounts for CFD and knockout products:
+- CFD account (default): standard instruments
+- **Barrières et Options account**: required for knockout order placement
+
+Set `IG_ACC_NUMBER` to the barrier account ID (e.g. `Z69ZML` on demo).
+
+### Cost model
+At typical Brent volatility (~10% intraday), IG knockout straddles cost ~350-450€ per leg at 4% barrier distance. Suitable for overnight/geopolitical events where automation justifies the higher cost vs SocGen turbos (~15-20€/unit).
 
 ---
 
@@ -296,18 +199,22 @@ Claude will search for current event dates and output a ready-to-paste JSON with
 ## Roadmap
 
 ### Near-term
+- [ ] assess_straddle() — query available barriers + costs at various distances, used by news alerts to suggest trades
+- [ ] Simultaneous leg placement — place call + put in parallel threads to reduce slippage
+- [ ] close_straddle() — close all open legs via Telegram /close command
+- [ ] /status command — show open IG positions + P&L
+- [ ] Scale-out alert — Telegram prompt when leg up 25%+ suggesting partial close
+- [ ] Auto-close at 02:00 UTC — prevent overnight knockout exposure
 - [ ] UKMTO monitor — scrape https://www.ukmto.org/ukmto-products/warnings/2026 for maritime warnings, plug into /signal (primary source, often precedes Bloomberg by 10-30 min)
-- [ ] ig/ folder — extract Brent price watcher and IG REST into ig/ module
 - [ ] monitor.py split — scrapers.py, navigation.py, source_finder.py
 - [ ] state.py — extract state management
 - [ ] Enable run_poll() with token budget
 - [ ] T+1 trade review — Sonnet post-mortem 24h after execution
-- [ ] IG live execution — real POST /positions/otc on IG demo then live
 - [ ] Sonnet correlation — explain price move using Bloomberg posts
 
 ### Medium-term
+- [ ] IG live execution — fund live account, verify public API works, migrate from internal API if possible
 - [ ] ATR-based dynamic thresholds
-- [ ] Telegram command interface — /status /events /positions /close
 - [ ] Whale reputation scoring
 - [ ] Signal buffer in MM for run_poll() Bloomberg integration
 

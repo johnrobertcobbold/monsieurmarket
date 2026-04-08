@@ -807,16 +807,15 @@ def _handle_telegram_signal(stype: str, data: dict):
         )
 
     elif stype == 'straddle':
-        parts = data.get('parts', [])
-        if len(parts) < 2:
-            send_message("Usage: /straddle <notional>\ne.g. /straddle 500")
-            return
-        try:
-            notional = float(parts[1])
-        except ValueError:
-            send_message("❌ Invalid notional — use a number e.g. /straddle 500")
-            return
-        execute_trade({'action': 'straddle', 'notional': notional, 'source': 'telegram'})
+        parts       = data.get('parts', [])
+        notional    = float(parts[1]) if len(parts) > 1 else CONFIG['ig']['default_notional']
+        barrier_pct = float(parts[2]) / 100 if len(parts) > 2 else CONFIG['ig']['default_barrier_pct']
+        execute_trade({
+            'action':      'straddle',
+            'notional':    notional,
+            'barrier_pct': barrier_pct,
+            'source':      'telegram',
+        })
 
     elif stype == 'status':
         _send_status()
@@ -858,17 +857,37 @@ def _handle_telegram_signal(stype: str, data: dict):
 def execute_trade(intent: dict):
     action = intent.get('action')
     if action == 'straddle':
-        _open_straddle(intent.get('notional', 250))
+        _open_straddle(
+            intent.get('notional',    CONFIG['ig']['default_notional']),
+            intent.get('barrier_pct', CONFIG['ig']['default_barrier_pct']),
+        )
     elif action == 'close':
         _close_straddle()
 
 
-def _open_straddle(notional: float):
-    send_message(
-        f"🛢 Straddle requested — {notional:.0f}€\n"
-        f"⚙️ Fetching IG knockout products...\n"
-        f"(not yet implemented)"
-    )
+def _open_straddle(notional: float, barrier_pct: float):
+    from ig.straddle import open_straddle
+    svc = get_ig_service()
+    if not svc:
+        send_message("❌ IG service not available")
+        return
+    send_message(f"🛢 Opening straddle — {notional:.0f}€ barrier {barrier_pct*100:.0f}%...")
+    result = open_straddle(svc, notional=notional, barrier_pct=barrier_pct)
+    if not result:
+        send_message("❌ Straddle failed")
+    elif 'error' in result:
+        send_message(f"❌ {result['error']}")
+        if 'call' in result:
+            send_message("⚠️ Call leg is open — close manually on IG!")
+    else:
+        send_message(
+            f"✅ Straddle opened\n"
+            f"📈 Call KO: {result['call_barrier']} "
+            f"({(result['current_price']-result['call_barrier'])/result['current_price']*100:.1f}%↓)\n"
+            f"📉 Put KO:  {result['put_barrier']} "
+            f"({(result['put_barrier']-result['current_price'])/result['current_price']*100:.1f}%↑)\n"
+            f"💰 Brent: {result['current_price']:.0f}"
+        )
 
 
 def _close_straddle():

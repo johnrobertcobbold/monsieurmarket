@@ -4,6 +4,7 @@ ig/service.py — IG Markets REST session and market snapshots.
 
 import os
 import logging
+from config import CONFIG
 
 log = logging.getLogger('MonsieurMarket')
 
@@ -33,6 +34,11 @@ def get_ig_service():
         acc_number = os.getenv("IG_ACC_NUMBER")
         if acc_number:
             svc.switch_account(acc_number, False)
+        # required for internal API (knockout orders)
+        svc.crud_session.session.headers.update({
+            'x-device-user-agent': CONFIG['ig']['device_user_agent'],
+            'IG-ACCOUNT-ID':       acc_number,
+        })
         _ig_service = svc
         log.info("IG Markets session established (demo)")
     except Exception as e:

@@ -54,6 +54,24 @@ CONFIG = {
     # ── DISPLAY ──────────────────────────────────────────────────────────────
     "display_timezone": "Europe/Paris",
 
+    # ── IG INTERNAL API ──────────────────────────────────────────────────────────
+    "ig": {
+        "demo": {
+            "deal_base":     "https://demo-deal.ig.com",
+            "api_base":      "https://demo-api.ig.com",
+        },
+        "live": {
+            "deal_base":     "https://deal.ig.com",
+            "api_base":      "https://api.ig.com",
+        },
+        "device_user_agent":    "vendor=IG Group | applicationType=ig | platform=WTP | version=0.6631.0+073d24c3",
+        "brent_call_epic":      "CC.D.LCO.OPTCALL.IP",
+        "brent_put_epic":       "CC.D.LCO.OPTPUT.IP",
+        "expiry":               "  FEB27",
+        "default_notional":     250,
+        "default_barrier_pct":  0.15,
+    },    
+
     # ── THEMES ───────────────────────────────────────────────────────────────
     "themes": [
         {
