@@ -34,7 +34,7 @@ Path("data/trades").mkdir(exist_ok=True)
 
 from scheduled_event_watcher import ScheduledEventWatcher
 from config import CONFIG
-from telegram import send_message, format_bloomberg_post
+from telegram import send_message, format_bloomberg_post, start_telegram_receiver
 from trumpstruth import start_trump_watcher
 
 from dotenv import load_dotenv
@@ -804,6 +804,8 @@ def _handle_signal(source: str, stype: str, data: dict):
             _handle_bloomberg_signal(stype, data)
         elif source == 'trump':
             _handle_trump_signal(stype, data)
+        elif source == 'telegram':
+            _handle_telegram_signal(stype, data)
         # Future sources plug in here:
         # elif source == 'ukmto':      _handle_ukmto_signal(stype, data)
         # elif source == 'polymarket': _handle_polymarket_signal(stype, data)
@@ -1343,6 +1345,79 @@ def run_poll():
 
 
 # ─────────────────────────────────────────────
+# TELEGRAM
+# ─────────────────────────────────────────────
+
+def _handle_telegram_signal(stype: str, data: dict):
+    """Handle incoming Telegram commands."""
+    log.info(f"📩 Telegram command: /{stype}")
+
+    if stype == 'help':
+        send_message(
+            "🎩 <b>MonsieurMarket Commands</b>\n\n"
+            "/straddle 500 — open balanced straddle\n\n"
+            "/status — show open positions\n"
+            "/pause  — pause autonomous trading\n"
+            "/resume — resume autonomous trading\n"
+            "/help   — this message"
+        )
+
+    elif stype == 'straddle':
+        parts = data.get('parts', [])
+        if len(parts) < 2:
+            send_message("Usage: /straddle <notional>\ne.g. /straddle 500")
+            return
+        try:
+            notional = float(parts[1])
+        except ValueError:
+            send_message("❌ Invalid notional — use a number e.g. /straddle 500")
+            return
+        execute_trade({'action': 'straddle', 'notional': notional, 'source': 'telegram'})
+
+    elif stype == 'status':
+        _send_status()
+
+    elif stype == 'pause':
+        send_message("⏸ Autonomous trading paused")
+
+    elif stype == 'resume':
+        send_message("▶️ Autonomous trading resumed")
+
+    else:
+        send_message(f"❓ Unknown command: /{stype}\nTry /help")
+
+
+def execute_trade(intent: dict):
+    action = intent.get('action')
+    if action == 'straddle':
+        _open_straddle(intent.get('notional', 250))
+    elif action == 'close':
+        _close_straddle()
+
+def _open_straddle(notional: float):
+    """Fetch IG knockouts and execute balanced straddle — TODO."""
+    send_message(
+        f"🛢 Straddle requested — {notional:.0f}€\n"
+        f"⚙️ Fetching IG knockout products...\n"
+        f"(not yet implemented)"
+    )
+
+def _close_straddle():
+    """Close all open straddle legs — TODO."""
+    send_message(
+        "🔴 Close straddle requested\n"
+        "(not yet implemented)"
+    )
+
+def _send_status():
+    """Placeholder — show current positions."""
+    send_message(
+        "📊 <b>Status</b>\n"
+        "No open positions\n"
+        "(not yet implemented)"
+    )
+
+# ─────────────────────────────────────────────
 # ENTRY POINT
 # ─────────────────────────────────────────────
 _monitor_proc = None
@@ -1397,6 +1472,9 @@ def main():
 
     # Launch monitor — it will signal MM when ready
     start_bloomberg_monitor()
+
+    # Start Telegram polling
+    start_telegram_receiver()
 
     send_message(
         "🎩 <b>MonsieurMarket is online</b>\n"

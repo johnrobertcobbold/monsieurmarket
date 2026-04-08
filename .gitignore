@@ -4,6 +4,7 @@
 # ── data / runtime state ─────────────────────
 data/
 trades/
+scheduled_events.json
 
 # ── polymarket ───────────────────────────────
 polymarket/market_relevance.json
