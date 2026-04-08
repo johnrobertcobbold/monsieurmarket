@@ -23,7 +23,6 @@ import random
 import schedule
 import requests
 import threading
-from collections import deque
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from flask import Flask, jsonify, request
@@ -36,6 +35,9 @@ from scheduled_event_watcher import ScheduledEventWatcher
 from config import CONFIG
 from telegram import send_message, format_bloomberg_post, start_telegram_receiver
 from trumpstruth import start_trump_watcher
+from ig import get_ig_service, check_ig_brent, format_ig_block
+from ig import start_price_watcher, register_tick_callback, price_state
+from ig import open_straddle, close_straddle
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -54,15 +56,6 @@ from polymarket import (
     WHALE_REPEAT_TRIGGER,
 )
 
-# IG Markets (optional — only imported if credentials present)
-try:
-    from trading_ig import IGService, IGStreamService
-    from trading_ig.streamer.manager import StreamingManager
-    from lightstreamer.client import Subscription, SubscriptionListener, ItemUpdate
-    IG_AVAILABLE = True
-except ImportError:
-    IG_AVAILABLE = False
-
 event_watcher = None
 
 # ─────────────────────────────────────────────
@@ -77,10 +70,6 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("MonsieurMarket")
-
-# ─────────────────────────────────────────────
-# POLYMARKET — imported from polymarket/ module
-# ─────────────────────────────────────────────
 
 
 # ─────────────────────────────────────────────
@@ -482,95 +471,21 @@ Keep it punchy and actionable. No fluff."""
 
 
 # ─────────────────────────────────────────────
-# IG MARKETS — REAL-TIME PRICE STREAM
+# IG — PRICE TICK CALLBACK
+# MM owns all reaction logic — streamer just delivers ticks
 # ─────────────────────────────────────────────
-class _PriceState:
-    def __init__(self):
-        self.last_alert_time = 0
-        self.tick_history    = deque()
-
-    def add_tick(self, mid: float):
-        now = time.time()
-        self.tick_history.append((now, mid))
-        cutoff = now - 15 * 60
-        while self.tick_history and self.tick_history[0][0] < cutoff:
-            self.tick_history.popleft()
-
-    def change_pct_over_window(self, window_min: float) -> float | None:
-        if len(self.tick_history) < 2:
-            return None
-        now          = time.time()
-        cutoff       = now - window_min * 60
-        window_ticks = [t for t in self.tick_history if t[0] >= cutoff]
-        if len(window_ticks) < 2:
-            return None
-        oldest = window_ticks[0][1]
-        latest = window_ticks[-1][1]
-        return (latest - oldest) / oldest * 100 if oldest else None
-
-    def rolling_change_pct(self):
-        return self.change_pct_over_window(10)
-
-    def can_alert(self):
-        return (time.time() - self.last_alert_time) > \
-               CONFIG["price_watcher"]["cooldown_min"] * 60
-
-    def mark_alerted(self):
-        self.last_alert_time = time.time()
-
-
-_price_state = _PriceState()
-_tick_count  = 0
-
-
-def _on_brent_tick(ticker):
-    """Called on every Lightstreamer price tick."""
-    import math
-
-    def _get(attr):
-        v = getattr(ticker, attr, None)
-        if isinstance(v, float) and math.isnan(v):
-            return None
-        return v
-
-    bid      = _get("bid")
-    offer    = _get("offer")
-    day_pct  = _get("day_percent_change_mid")
-    day_open = _get("day_open_mid")
-    day_high = _get("day_high")
-    day_low  = _get("day_low")
-
-    def valid(v):
-        return v is not None and not (isinstance(v, float) and math.isnan(v)) and v != 0
-
-    if valid(bid) and valid(offer):
-        mid = (bid + offer) / 2
-    elif valid(day_open) and valid(day_pct):
-        mid = day_open * (1 + day_pct / 100)
-    elif valid(day_open):
-        mid = day_open
-    else:
-        return
-
-    _price_state.add_tick(mid)
-
-    global _tick_count
-    _tick_count += 1
-    if _tick_count % 10 == 1:
-        log.info(
-            f"Brent  mid={mid:.2f}"
-            + (f"  bid={bid:.2f} ask={offer:.2f}" if valid(bid) and valid(offer) else "  (derived)")
-            + (f"  day={day_pct:+.2f}%" if valid(day_pct) else "")
-            + (f"  [{day_low:.2f}–{day_high:.2f}]" if valid(day_low) and valid(day_high) else "")
-        )
-
+def _on_brent_price(mid, bid, ask, day_pct, day_open, day_high, day_low):
+    """MM's reaction to every Brent tick."""
     if event_watcher is not None:
         event_watcher.on_tick(mid)
 
-    if not _price_state.can_alert():
+    cfg = CONFIG["price_watcher"]
+    if not price_state.can_alert(cfg["cooldown_min"]):
         return
 
-    cfg          = CONFIG["price_watcher"]
+    def valid(v):
+        return v is not None and v != 0
+
     alert_reason = None
     alert_emoji  = ""
 
@@ -585,7 +500,7 @@ def _on_brent_tick(ticker):
 
     # Trigger 2 — multi-window rolling moves (shortest window wins)
     for (window_min, threshold_pct, label) in cfg["rolling_windows"]:
-        chg = _price_state.change_pct_over_window(window_min)
+        chg = price_state.change_pct_over_window(window_min)
         if chg is not None and abs(chg) >= threshold_pct:
             direction   = "📈 UP" if chg > 0 else "📉 DOWN"
             rolling_msg = (
@@ -602,8 +517,8 @@ def _on_brent_tick(ticker):
 
     now_str    = datetime.now().strftime("%d/%m %H:%M")
     price_line = (
-        f"Bid: {bid:.2f}  Ask: {offer:.2f}\n"
-        if valid(bid) and valid(offer)
+        f"Bid: {bid:.2f}  Ask: {ask:.2f}\n"
+        if valid(bid) and valid(ask)
         else f"Mid (derived): {mid:.2f}\n"
     )
     range_line = (
@@ -617,10 +532,8 @@ def _on_brent_tick(ticker):
         f"{price_line}{range_line}"
         f"\n⏰ {now_str}"
     )
-    _price_state.mark_alerted()
+    price_state.mark_alerted()
     log.info(f"Price alert sent — {alert_reason[:60]}")
-
-    # Brent moved — ask Bloomberg monitor to scrape immediately
     bloomberg_scheduler.trigger_now(reason=alert_reason[:60])
 
 
@@ -628,33 +541,17 @@ def _on_brent_tick(ticker):
 # BLOOMBERG SCHEDULER — MM owns the refresh timer
 # ─────────────────────────────────────────────
 class BloombergScheduler:
-    """
-    MM-owned timer that decides when to ask monitor to scrape.
-    Monitor has no internal timer — this is the brain's schedule.
-
-    Refresh intervals (French market hours, hardcoded UTC offsets for CEST):
-        06:00–20:00 UTC (08:00–22:00 Paris) — every ~5 min
-        04:00–06:00 UTC (06:00–08:00 Paris) — every ~15 min
-        else                                 — every 60 min overnight
-
-    Immediate refresh triggered by:
-        - Brent price spike
-        - Trump post about Iran
-        - Any future signal source
-    """
     def __init__(self):
         self._timer = None
         self._lock  = threading.Lock()
         self._ready = False
 
     def on_ready(self):
-        """Monitor found a source — start the refresh schedule."""
         self._ready = True
         log.info("Bloomberg scheduler: monitor ready — starting refresh schedule")
         self._schedule_next()
 
     def on_no_source(self):
-        """Monitor has no source — schedule a retry."""
         self._ready = False
         self.cancel()
         retry_sec = self._interval_sec()
@@ -665,7 +562,6 @@ class BloombergScheduler:
             self._timer.start()
 
     def trigger_now(self, reason: str = ''):
-        """Immediate refresh — called on Brent spike, Trump post, etc."""
         if not self._ready:
             log.debug("Bloomberg scheduler: trigger_now called but monitor not ready yet")
             return
@@ -691,13 +587,6 @@ class BloombergScheduler:
         threading.Thread(target=self._do_refresh, daemon=True).start()
 
     def _do_refresh(self):
-        """
-        GET /refresh on monitor.
-        New posts come back as POST /signal calls — no polling needed.
-
-        TODO: Sonnet correlation on price spike
-        Pass price context here so /signal handler can correlate news with the move.
-        """
         try:
             log.info("Bloomberg scheduler: calling /refresh on monitor...")
             r = requests.get('http://localhost:3457/refresh', timeout=35)
@@ -706,23 +595,16 @@ class BloombergScheduler:
         except Exception as e:
             log.warning(f"Bloomberg scheduler: /refresh failed: {e}")
         finally:
-            log.info(f"Bloomberg scheduler: _do_refresh finally — _ready={self._ready}")
             self._schedule_next()
 
     def _interval_sec(self) -> int:
-        """
-        Market-hours aware interval.
-        Hardcoded for CEST (UTC+2) — covers April-October.
-        Paris 08:00-22:00 = UTC 06:00-20:00
-        """
         now  = datetime.now(timezone.utc)
         hour = now.hour
 
         if 6 <= hour < 20:
-            return 5 * 60 + random.randint(-30, 90)    # market hours
+            return 5 * 60 + random.randint(-30, 90)
 
         elif 4 <= hour < 6:
-            # pre-market — align to market open if next refresh would overshoot
             next_refresh = now + timedelta(seconds=15 * 60)
             if next_refresh.hour >= 6:
                 target = now.replace(hour=6, minute=0, second=0, microsecond=0)
@@ -732,7 +614,6 @@ class BloombergScheduler:
             return 15 * 60 + random.randint(-60, 60)
 
         else:
-            # overnight — align to pre-market if next refresh would overshoot
             next_refresh = now + timedelta(seconds=60 * 60)
             if next_refresh.hour >= 4:
                 target = now.replace(hour=4, minute=0, second=0, microsecond=0)
@@ -741,7 +622,7 @@ class BloombergScheduler:
                 secs = int((target - now).total_seconds())
                 log.info(f"Bloomberg scheduler: aligning to pre-market in {secs // 60}min")
                 return secs
-            return 60 * 60  # deep overnight
+            return 60 * 60
 
 
 bloomberg_scheduler = BloombergScheduler()
@@ -755,18 +636,6 @@ mm_app = Flask('MonsieurMarketAPI')
 
 @mm_app.route('/signal', methods=['POST'])
 def receive_signal():
-    """
-    Single entry point for all signals from all sources.
-    Returns 200 immediately — processing happens in background thread.
-
-    Payload:
-    {
-        "source": "bloomberg|price|trump|polymarket",
-        "type":   "ready|no_source|post|error",
-        "data":   { ... source-specific ... },
-        "ts":     1744030000
-    }
-    """
     try:
         payload = request.get_json(force=True)
         if not payload:
@@ -778,7 +647,6 @@ def receive_signal():
 
         log.info(f"📨 Signal: {source}/{stype}")
 
-        # Process in background — don't block the monitor
         threading.Thread(
             target=_handle_signal,
             args=(source, stype, data),
@@ -798,7 +666,6 @@ def mm_health():
 
 
 def _handle_signal(source: str, stype: str, data: dict):
-    """Brain — routes and processes each signal."""
     try:
         if source == 'bloomberg':
             _handle_bloomberg_signal(stype, data)
@@ -806,16 +673,11 @@ def _handle_signal(source: str, stype: str, data: dict):
             _handle_trump_signal(stype, data)
         elif source == 'telegram':
             _handle_telegram_signal(stype, data)
-        # Future sources plug in here:
-        # elif source == 'ukmto':      _handle_ukmto_signal(stype, data)
-        # elif source == 'polymarket': _handle_polymarket_signal(stype, data)
     except Exception as e:
         log.error(f"Signal handler error ({source}/{stype}): {e}")
 
 
 def _handle_bloomberg_signal(stype: str, data: dict):
-    """Handle signals from the Bloomberg monitor."""
-
     if stype == 'ready':
         src  = data.get('source_type', '?')
         url  = data.get('source_url', '')[:70]
@@ -836,8 +698,6 @@ def _handle_bloomberg_signal(stype: str, data: dict):
         )
 
     elif stype == 'post':
-        # New post — send to Telegram immediately.
-        # Brain logic here later: score, correlate with price/whales, etc.
         log.info(f"Bloomberg post: {data.get('title', '')[:60]}")
         send_message(format_bloomberg_post(data))
 
@@ -848,23 +708,17 @@ def _handle_bloomberg_signal(stype: str, data: dict):
             f"🚨 <b>Bloomberg Monitor Error</b>\n\n"
             f"{msg[:200]}\n\n"
             f"⏰ {datetime.now().strftime('%d/%m %H:%M')}"
-        )        
+        )
 
 
 def _handle_trump_signal(stype: str, data: dict):
-    """
-    Handle Trump post signals from trumpstruth watcher.
-    Haiku filters, Sonnet analyses, MM sends to Telegram.
-    """
     if stype != 'post':
         return
 
     post  = data
     title = post.get('title', '')
-    url   = post.get('url', '')
     log.info(f"Trump signal received: {title[:80]}")
 
-    # Haiku filter — cheap yes/no
     try:
         client   = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
         response = client.messages.create(
@@ -888,7 +742,6 @@ def _handle_trump_signal(stype: str, data: dict):
 
     log.info("  → RELEVANT — firing Sonnet analysis")
 
-    # Sonnet analysis + web search
     try:
         themes_text = ", ".join(t["name"] for t in CONFIG["themes"] if t.get("active"))
         response    = client.messages.create(
@@ -928,248 +781,91 @@ def _handle_trump_signal(stype: str, data: dict):
 
 
 def start_mm_api():
-    """Start MM Flask signal API in a background thread."""
     def _run():
         log.info("🧠 MM Signal API on port 3456")
-        mm_app.run(
-            host='0.0.0.0',
-            port=3456,
-            debug=False,
-            use_reloader=False,
-        )
+        mm_app.run(host='0.0.0.0', port=3456, debug=False, use_reloader=False)
     t = threading.Thread(target=_run, name='MMApi', daemon=True)
     t.start()
-    # Give Flask a moment to bind before other threads try to connect
     time.sleep(1)
     log.info("MM Signal API ready")
 
 
 # ─────────────────────────────────────────────
-# IG MARKETS — MARKET LISTENER
+# TELEGRAM
 # ─────────────────────────────────────────────
-class _MarketListener(SubscriptionListener if IG_AVAILABLE else object):
-    def onItemUpdate(self, update: "ItemUpdate"):
-        try:
-            bid        = update.getValue("BID")
-            offer      = update.getValue("OFFER")
-            change_pct = update.getValue("CHANGE_PCT")
-            change     = update.getValue("CHANGE")
-            high       = update.getValue("HIGH")
-            low        = update.getValue("LOW")
-            state      = update.getValue("MARKET_STATE")
-            upd_time   = update.getValue("UPDATE_TIME")
+def _handle_telegram_signal(stype: str, data: dict):
+    log.info(f"📩 Telegram command: /{stype}")
 
-            def to_f(v):
-                try:
-                    return float(v) if v not in (None, "") else None
-                except (TypeError, ValueError):
-                    return None
-
-            class _T:
-                pass
-            t = _T()
-            t.bid                    = to_f(bid)
-            t.offer                  = to_f(offer)
-            t.day_percent_change_mid = to_f(change_pct)
-            t.day_net_change_mid     = to_f(change)
-            t.day_high               = to_f(high)
-            t.day_low                = to_f(low)
-            t.day_open_mid           = (
-                t.bid / (1 + t.day_percent_change_mid / 100)
-                if t.bid and t.day_percent_change_mid
-                else None
-            )
-            t.timestamp    = upd_time
-            t.market_state = state
-
-            _on_brent_tick(t)
-
-        except Exception as e:
-            log.debug(f"Market listener parse error: {e}")
-
-    def onSubscription(self):
-        log.info("Brent MARKET subscription active ✅")
-
-    def onSubscriptionError(self, code, message):
-        log.warning(f"Brent MARKET subscription error: {code} — {message}")
-
-    def onUnsubscription(self):
-        log.info("Brent MARKET subscription stopped")
-
-
-def _stream_worker():
-    username = os.getenv("IG_USERNAME")
-    password = os.getenv("IG_PASSWORD")
-    api_key  = os.getenv("IG_API_KEY")
-    acc_num  = os.getenv("IG_ACC_NUMBER")
-    epic     = os.getenv("IG_BRENT_EPIC", "").strip()
-
-    if not all([username, password, api_key, epic]):
-        log.warning("Price watcher: IG credentials or epic not set — skipping stream")
-        return
-
-    while True:
-        try:
-            log.info(f"Price watcher: connecting (epic={epic})")
-            ig_svc = IGService(
-                username, password, api_key,
-                acc_type="DEMO",
-                acc_number=acc_num,
-            )
-            ig_stream = IGStreamService(ig_svc)
-            ig_stream.acc_number = acc_num
-            ig_stream.create_session(version="3")
-
-            sm     = StreamingManager(ig_stream)
-            sm.start_tick_subscription(epic)
-            ticker = sm.ticker(epic, timeout_length=10)
-            log.info(f"Price watcher: ✅ got ticker — {ticker}")
-
-            last_ts = None
-            while True:
-                if ticker.timestamp != last_ts:
-                    last_ts = ticker.timestamp
-                    _on_brent_tick(ticker)
-                time.sleep(0.5)
-
-        except Exception as e:
-            log.error(f"Price watcher stream error: {e} — reconnecting in 30s")
-            time.sleep(30)
-
-
-def start_price_watcher():
-    if not CONFIG["price_watcher"]["enabled"]:
-        log.info("Price watcher disabled in config")
-        return
-    if not IG_AVAILABLE:
-        log.warning("Price watcher: trading-ig not installed — skipping")
-        return
-    t = threading.Thread(target=_stream_worker, name="PriceWatcher", daemon=True)
-    t.start()
-    log.info("Price watcher thread started")
-
-
-# ─────────────────────────────────────────────
-# POLYMARKET WEBSOCKET — extracted to polymarket/
-# ─────────────────────────────────────────────
-# start_polymarket_ws is imported from polymarket module
-# callbacks passed so it can send Telegram and manage state
-
-
-# ─────────────────────────────────────────────
-# IG MARKETS — REST SNAPSHOT
-# ─────────────────────────────────────────────
-_ig_service = None
-
-
-def _get_ig_service():
-    global _ig_service
-    if not IG_AVAILABLE:
-        return None
-    username = os.getenv("IG_USERNAME")
-    password = os.getenv("IG_PASSWORD")
-    api_key  = os.getenv("IG_API_KEY")
-    if not all([username, password, api_key]):
-        return None
-    if _ig_service is not None:
-        return _ig_service
-    try:
-        svc = IGService(username, password, api_key, acc_type="DEMO")
-        svc.create_session()
-        acc_number = os.getenv("IG_ACC_NUMBER")
-        if acc_number:
-            svc.switch_account(acc_number, False)
-        _ig_service = svc
-        log.info("IG Markets session established (demo)")
-    except Exception as e:
-        log.warning(f"IG Markets login failed: {e}")
-        _ig_service = None
-    return _ig_service
-
-
-def check_ig_brent() -> dict | None:
-    svc  = _get_ig_service()
-    epic = os.getenv("IG_BRENT_EPIC", "").strip()
-    if svc is None or not epic:
-        return None
-    try:
-        info         = svc.fetch_market_by_epic(epic)
-        snap         = info.get("snapshot", {}) if isinstance(info, dict) else {}
-        inst         = info.get("instrument", {}) if isinstance(info, dict) else {}
-        bid          = float(snap.get("bid") or 0)
-        ask          = float(snap.get("offer") or snap.get("ask") or 0)
-        mid          = (bid + ask) / 2 if bid and ask else 0
-        net_chg      = float(snap.get("netChange") or 0)
-        net_chg_pct  = float(snap.get("percentageChange") or 0)
-        high         = float(snap.get("high") or 0)
-        low          = float(snap.get("low") or 0)
-        market_state = snap.get("marketStatus", "UNKNOWN")
-
-        knock_out = None
-        for field in ["knockoutLevel", "limitLevel", "stopLevel"]:
-            val = inst.get(field) or snap.get(field)
-            if val:
-                try:
-                    knock_out = float(val)
-                    break
-                except (TypeError, ValueError):
-                    pass
-
-        barrier_distance_pct = None
-        barrier_warning      = False
-        if knock_out and mid:
-            barrier_distance_pct = abs((mid - knock_out) / mid) * 100
-            barrier_warning      = barrier_distance_pct < 5.0
-
-        result = {
-            "epic": epic, "bid": bid, "ask": ask, "mid": mid,
-            "net_chg": net_chg, "net_chg_pct": net_chg_pct,
-            "high": high, "low": low, "market_state": market_state,
-            "knock_out_level": knock_out,
-            "barrier_distance_pct": barrier_distance_pct,
-            "barrier_warning": barrier_warning,
-        }
-        log.info(
-            f"IG Brent: mid={mid:.2f} chg={net_chg_pct:+.2f}% state={market_state}"
-            + (f" ⚠️ barrier {barrier_distance_pct:.1f}% away" if barrier_warning else "")
+    if stype == 'help':
+        send_message(
+            "🎩 <b>MonsieurMarket Commands</b>\n\n"
+            "/straddle 500 — open balanced straddle\n\n"
+            "/status — show open positions\n"
+            "/pause  — pause autonomous trading\n"
+            "/resume — resume autonomous trading\n"
+            "/help   — this message"
         )
-        return result
-    except Exception as e:
-        lvl = log.debug if "500" in str(e) else log.warning
-        lvl(f"IG REST snapshot failed: {e}")
-        global _ig_service
-        _ig_service = None
-        return None
+
+    elif stype == 'straddle':
+        parts = data.get('parts', [])
+        if len(parts) < 2:
+            send_message("Usage: /straddle <notional>\ne.g. /straddle 500")
+            return
+        try:
+            notional = float(parts[1])
+        except ValueError:
+            send_message("❌ Invalid notional — use a number e.g. /straddle 500")
+            return
+        execute_trade({'action': 'straddle', 'notional': notional, 'source': 'telegram'})
+
+    elif stype == 'status':
+        _send_status()
+
+    elif stype == 'pause':
+        send_message("⏸ Autonomous trading paused")
+
+    elif stype == 'resume':
+        send_message("▶️ Autonomous trading resumed")
+
+    else:
+        send_message(f"❓ Unknown command: /{stype}\nTry /help")
 
 
-def format_ig_block(ig: dict) -> str:
-    if not ig:
-        return ""
-    arrow      = "📈" if ig["net_chg_pct"] >= 0 else "📉"
-    state_icon = "🟢" if ig["market_state"] == "TRADEABLE" else "🔴"
-    lines = [
-        "",
-        f"🛢 <b>Brent (IG live)</b> {state_icon}",
-        f"  Bid {ig['bid']:.2f} / Ask {ig['ask']:.2f}  {arrow} {ig['net_chg_pct']:+.2f}% today",
-        f"  Range: {ig['low']:.2f} – {ig['high']:.2f}",
-    ]
-    if ig.get("knock_out_level"):
-        lines.append(
-            f"  Knock-out barrier: <b>{ig['knock_out_level']:.2f}</b>  "
-            f"({ig['barrier_distance_pct']:.1f}% away)"
-        )
-        if ig["barrier_warning"]:
-            lines.append("  ⚠️ <b>BARRIER PROXIMITY ALERT — within 5%</b>")
-    return "\n".join(lines)
+def execute_trade(intent: dict):
+    action = intent.get('action')
+    if action == 'straddle':
+        _open_straddle(intent.get('notional', 250))
+    elif action == 'close':
+        _close_straddle()
+
+
+def _open_straddle(notional: float):
+    send_message(
+        f"🛢 Straddle requested — {notional:.0f}€\n"
+        f"⚙️ Fetching IG knockout products...\n"
+        f"(not yet implemented)"
+    )
+
+
+def _close_straddle():
+    send_message(
+        "🔴 Close straddle requested\n"
+        "(not yet implemented)"
+    )
+
+
+def _send_status():
+    send_message(
+        "📊 <b>Status</b>\n"
+        "No open positions\n"
+        "(not yet implemented)"
+    )
 
 
 # ─────────────────────────────────────────────
-# MAIN POLLING LOOP (disabled — too expensive)
+# POLLING LOOP (disabled — too expensive)
 # ─────────────────────────────────────────────
-
-
 def fetch_rss_headlines(state: dict) -> tuple[list[dict], dict]:
-    """Fetch recent headlines from free RSS feeds. Filters out already-seen URLs."""
     sources = [
         {"name": "Reuters",    "url": "https://feeds.reuters.com/reuters/topNews"},
         {"name": "Al Jazeera", "url": "https://www.aljazeera.com/xml/rss/all.xml"},
@@ -1198,12 +894,6 @@ def fetch_rss_headlines(state: dict) -> tuple[list[dict], dict]:
 
 
 def run_poll():
-    """
-    Main polling function — currently disabled (Haiku + Sonnet/web-search cost).
-    Re-enable in main() when budget allows:
-        run_poll()
-        schedule.every(CONFIG["poll_interval_minutes"]).minutes.do(run_poll)
-    """
     log.info("── Poll cycle starting ──")
     state = load_state()
     state = clean_state(state)
@@ -1280,8 +970,8 @@ def run_poll():
     poll_interval_sec = CONFIG["poll_interval_minutes"] * 60
     time_since_last   = time.time() - state.get("last_news_poll", 0)
     force_news        = whale_flow_trigger or bool(
-        _price_state.tick_history and
-        abs(_price_state.rolling_change_pct() or 0) >= CONFIG["price_watcher"]["trigger_pct_from_open"]
+        price_state.tick_history and
+        abs(price_state.rolling_change_pct() or 0) >= CONFIG["price_watcher"]["trigger_pct_from_open"]
     )
 
     if time_since_last < poll_interval_sec and not force_news:
@@ -1292,10 +982,6 @@ def run_poll():
         all_headlines, state    = fetch_rss_headlines(state)
         state["last_news_poll"] = time.time()
         log.info(f"RSS: {len(all_headlines)} new headlines")
-
-    # Bloomberg posts arrive via /signal — no fetch needed here
-    # TODO: implement signal buffer for run_poll() integration
-    bloomberg_headlines = []
 
     for theme in CONFIG["themes"]:
         if not theme.get("active"):
@@ -1345,100 +1031,20 @@ def run_poll():
 
 
 # ─────────────────────────────────────────────
-# TELEGRAM
-# ─────────────────────────────────────────────
-
-def _handle_telegram_signal(stype: str, data: dict):
-    """Handle incoming Telegram commands."""
-    log.info(f"📩 Telegram command: /{stype}")
-
-    if stype == 'help':
-        send_message(
-            "🎩 <b>MonsieurMarket Commands</b>\n\n"
-            "/straddle 500 — open balanced straddle\n\n"
-            "/status — show open positions\n"
-            "/pause  — pause autonomous trading\n"
-            "/resume — resume autonomous trading\n"
-            "/help   — this message"
-        )
-
-    elif stype == 'straddle':
-        parts = data.get('parts', [])
-        if len(parts) < 2:
-            send_message("Usage: /straddle <notional>\ne.g. /straddle 500")
-            return
-        try:
-            notional = float(parts[1])
-        except ValueError:
-            send_message("❌ Invalid notional — use a number e.g. /straddle 500")
-            return
-        execute_trade({'action': 'straddle', 'notional': notional, 'source': 'telegram'})
-
-    elif stype == 'status':
-        _send_status()
-
-    elif stype == 'pause':
-        send_message("⏸ Autonomous trading paused")
-
-    elif stype == 'resume':
-        send_message("▶️ Autonomous trading resumed")
-
-    else:
-        send_message(f"❓ Unknown command: /{stype}\nTry /help")
-
-
-def execute_trade(intent: dict):
-    action = intent.get('action')
-    if action == 'straddle':
-        _open_straddle(intent.get('notional', 250))
-    elif action == 'close':
-        _close_straddle()
-
-def _open_straddle(notional: float):
-    """Fetch IG knockouts and execute balanced straddle — TODO."""
-    send_message(
-        f"🛢 Straddle requested — {notional:.0f}€\n"
-        f"⚙️ Fetching IG knockout products...\n"
-        f"(not yet implemented)"
-    )
-
-def _close_straddle():
-    """Close all open straddle legs — TODO."""
-    send_message(
-        "🔴 Close straddle requested\n"
-        "(not yet implemented)"
-    )
-
-def _send_status():
-    """Placeholder — show current positions."""
-    send_message(
-        "📊 <b>Status</b>\n"
-        "No open positions\n"
-        "(not yet implemented)"
-    )
-
-# ─────────────────────────────────────────────
 # ENTRY POINT
 # ─────────────────────────────────────────────
 _monitor_proc = None
 
 
 def start_bloomberg_monitor():
-    """
-    Launch bloomberg monitor as a managed subprocess.
-    MM owns the monitor lifecycle — if it crashes, MM can restart it.
-    --visible flag is passed through from MM's own argv.
-    """
     global _monitor_proc
     import subprocess
-
     cmd = [sys.executable, 'bloomberg/monitor.py']
     if '--visible' in sys.argv:
         cmd.append('--visible')
         log.info("🦊 Starting Bloomberg monitor (headful)...")
     else:
         log.info("🦊 Starting Bloomberg monitor (headless)...")
-
     _monitor_proc = subprocess.Popen(cmd)
     log.info(f"Bloomberg monitor started (pid={_monitor_proc.pid})")
 
@@ -1461,19 +1067,12 @@ def main():
         log.info(f"Loaded {len(markets)} Polymarket market(s)")
 
     ig_status = "not configured"
-    if IG_AVAILABLE and all(os.getenv(v) for v in ["IG_USERNAME", "IG_PASSWORD", "IG_API_KEY"]):
-        ig_svc    = _get_ig_service()
+    if all(os.getenv(v) for v in ["IG_USERNAME", "IG_PASSWORD", "IG_API_KEY"]):
+        ig_svc    = get_ig_service()
         ig_status = "✅ connected (demo)" if ig_svc else "❌ login failed"
-    elif not IG_AVAILABLE:
-        ig_status = "⚠️ trading-ig not installed"
 
-    # Start MM Signal API first so monitor can POST /signal on startup
     start_mm_api()
-
-    # Launch monitor — it will signal MM when ready
     start_bloomberg_monitor()
-
-    # Start Telegram polling
     start_telegram_receiver()
 
     send_message(
@@ -1487,7 +1086,8 @@ def main():
         f"IG Markets: {ig_status}"
     )
 
-    start_price_watcher()
+    register_tick_callback(_on_brent_price)
+    start_price_watcher(CONFIG)
     start_polymarket_ws(
         send_telegram_fn=send_message,
         load_state_fn=load_state,
