@@ -982,12 +982,12 @@ def browser_loop():
                         last_refresh = state.get('last_refresh')
 
                     should_check = True
+                    hour            = datetime.now(timezone.utc).hour
                     check_interval  = 15 if 6 <= hour < 20 else 60
                     if last_refresh:
                         try:
                             last_dt         = datetime.fromisoformat(last_refresh)
                             mins_since      = (datetime.now(timezone.utc) - last_dt).total_seconds() / 60
-                            hour            = datetime.now(timezone.utc).hour
                             should_check    = mins_since >= check_interval
                         except Exception:
                             pass

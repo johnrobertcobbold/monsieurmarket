@@ -24,7 +24,7 @@ import schedule
 import requests
 import threading
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from flask import Flask, jsonify, request
 import sys
@@ -715,10 +715,33 @@ class BloombergScheduler:
         Hardcoded for CEST (UTC+2) — covers April-October.
         Paris 08:00-22:00 = UTC 06:00-20:00
         """
-        hour = datetime.now(timezone.utc).hour
-        if   6 <= hour < 20: return  5 * 60 + random.randint(-30, 90)  # market hours
-        elif 4 <= hour < 6:  return 15 * 60 + random.randint(-60, 60)  # pre-market
-        else:                return 60 * 60                              # overnight
+        now  = datetime.now(timezone.utc)
+        hour = now.hour
+
+        if 6 <= hour < 20:
+            return 5 * 60 + random.randint(-30, 90)    # market hours
+
+        elif 4 <= hour < 6:
+            # pre-market — align to market open if next refresh would overshoot
+            next_refresh = now + timedelta(seconds=15 * 60)
+            if next_refresh.hour >= 6:
+                target = now.replace(hour=6, minute=0, second=0, microsecond=0)
+                secs = int((target - now).total_seconds())
+                log.info(f"Bloomberg scheduler: aligning to market open in {secs // 60}min")
+                return secs
+            return 15 * 60 + random.randint(-60, 60)
+
+        else:
+            # overnight — align to pre-market if next refresh would overshoot
+            next_refresh = now + timedelta(seconds=60 * 60)
+            if next_refresh.hour >= 4:
+                target = now.replace(hour=4, minute=0, second=0, microsecond=0)
+                if target <= now:
+                    target += timedelta(days=1)
+                secs = int((target - now).total_seconds())
+                log.info(f"Bloomberg scheduler: aligning to pre-market in {secs // 60}min")
+                return secs
+            return 60 * 60  # deep overnight
 
 
 bloomberg_scheduler = BloombergScheduler()
