@@ -827,6 +827,30 @@ def _handle_telegram_signal(stype: str, data: dict):
     elif stype == 'resume':
         send_message("▶️ Autonomous trading resumed")
 
+    elif stype == 'discover':
+        svc = get_ig_service()
+        try:
+            # fetch market navigation nodes
+            result = svc.fetch_top_level_navigation_nodes()
+            log.info(f"top level nodes: {result}")
+        except Exception as e:
+            log.error(f"top nodes failed: {e}")
+    
+        try:
+            # try with known knockout epic format variations
+            for epic in [
+                'CC.D.LCO.OPTCALL.IP.9000',
+                'KO.D.LCO.CALL.9000.IP',
+                'IX.D.LCO.OPTCALL.9000.IP',
+            ]:
+                try:
+                    result = svc.fetch_market_by_epic(epic)
+                    log.info(f"✅ {epic}: {result}")
+                except Exception as e:
+                    log.info(f"❌ {epic}: {e}")
+        except Exception as e:
+            log.error(f"epic test failed: {e}")
+
     else:
         send_message(f"❓ Unknown command: /{stype}\nTry /help")
 

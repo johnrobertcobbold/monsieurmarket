@@ -40,6 +40,28 @@ def get_ig_service():
         _ig_service = None
     return _ig_service
 
+def get_ig_service_live():
+    """Read-only live service for market discovery."""
+    global _ig_service_live
+    username = os.getenv("IG_USERNAME_LIVE")
+    password = os.getenv("IG_PASSWORD_LIVE")
+    api_key  = os.getenv("IG_API_KEY_LIVE")
+    if not all([username, password, api_key]):
+        return None
+    if _ig_service_live is not None:
+        return _ig_service_live
+    try:
+        svc = IGService(username, password, api_key, acc_type="LIVE")
+        svc.create_session()
+        acc_number = os.getenv("IG_ACC_NUMBER_LIVE")
+        if acc_number:
+            svc.switch_account(acc_number, False)
+        _ig_service_live = svc
+        log.info("IG Markets LIVE session established (read-only)")
+    except Exception as e:
+        log.warning(f"IG Markets LIVE login failed: {e}")
+        _ig_service_live = None
+    return _ig_service_live
 
 def reset_session():
     """Force session reconnect on next call."""
