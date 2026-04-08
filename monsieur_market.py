@@ -840,7 +840,13 @@ def _handle_bloomberg_signal(stype: str, data: dict):
         send_message(format_bloomberg_post(data))
 
     elif stype == 'error':
-        log.warning(f"Bloomberg monitor error: {data.get('msg', '')}")
+        msg = data.get('msg', '')
+        log.warning(f"Bloomberg monitor error: {msg}")
+        send_message(
+            f"🚨 <b>Bloomberg Monitor Error</b>\n\n"
+            f"{msg[:200]}\n\n"
+            f"⏰ {datetime.now().strftime('%d/%m %H:%M')}"
+        )        
 
 
 def _handle_trump_signal(stype: str, data: dict):

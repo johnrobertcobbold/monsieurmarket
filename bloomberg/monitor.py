@@ -190,19 +190,20 @@ def load_persistent_posts() -> list:
 # STATE
 # ─────────────────────────────────────────────
 state = {
-    'status':          'starting',
-    'date':            None,
-    'source_type':     None,
-    'source_url':      None,
-    'posts':           load_persistent_posts(),
-    'post_count':      0,
-    'last_post_ts':    0,
-    'last_refresh':    None,
-    'latest_tag_url':  None,
-    'latest_tag_name': None,
-    'tag_set_date':    None,
-    'next_retry':      None,
-    'errors':          [],
+    'status':               'starting',
+    'date':                 None,
+    'source_type':          None,
+    'source_url':           None,
+    'posts':                load_persistent_posts(),
+    'post_count':           0,
+    'last_post_ts':         0,
+    'last_refresh':         None,
+    'last_liveblog_check':  None,
+    'latest_tag_url':       None,
+    'latest_tag_name':      None,
+    'tag_set_date':         None,
+    'next_retry':           None,
+    'errors':               [],
 }
 
 # restore persisted tag fields on startup
@@ -862,163 +863,156 @@ def recycle_page(context, session: dict):
 def browser_loop():
     global _page, _context
 
-    session = load_session()
-    if not session:
-        update_state(status='auth_failed')
-        return
+    try:
+        session = load_session()
+        if not session:
+            update_state(status='auth_failed')
+            return
 
-    log.info(f"🦊 Starting Camoufox (headless={HEADLESS})...")
+        log.info(f"🦊 Starting Camoufox (headless={HEADLESS})...")
 
-    with Camoufox(headless=HEADLESS) as browser:
-        _context = browser.new_context()
-        _context.add_cookies(session['cookies'])
-        _page = _context.new_page()
+        with Camoufox(headless=HEADLESS) as browser:
+            _context = browser.new_context()
+            _context.add_cookies(session['cookies'])
+            _page = _context.new_page()
 
-        log.info("🔐 Verifying session...")
-        _page.goto('https://www.bloomberg.com',
-                   timeout=15000, wait_until='domcontentloaded')
-        cookies  = _context.cookies()
-        has_auth = any(c['name'] in ('_user-token', 'session_key') for c in cookies)
-        log.info("✅ Session valid" if has_auth else "⚠️  Auth cookies not found")
+            log.info("🔐 Verifying session...")
+            _page.goto('https://www.bloomberg.com',
+                       timeout=15000, wait_until='domcontentloaded')
+            cookies  = _context.cookies()
+            has_auth = any(c['name'] in ('_user-token', 'session_key') for c in cookies)
+            log.info("✅ Session valid" if has_auth else "⚠️  Auth cookies not found")
 
-        scrape_cycle = 0
+            scrape_cycle = 0
 
-        while True:
-            today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+            while True:
+                today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
 
-            # new day — reset source so we search again tomorrow
-            with state_lock:
-                stored_date = state.get('date')
+                with state_lock:
+                    stored_date = state.get('date')
 
-            if stored_date and stored_date != today:
-                log.info(f"📅 New day ({today}) — resetting source")
-                update_state(date=None, source_type=None,
-                             source_url=None, status='searching')
+                if stored_date and stored_date != today:
+                    log.info(f"📅 New day ({today}) — resetting source")
+                    update_state(date=None, source_type=None,
+                                 source_url=None, status='searching')
 
-            # find source if needed
-            with state_lock:
-                source_url  = state.get('source_url')
-                source_type = state.get('source_type')
+                with state_lock:
+                    source_url  = state.get('source_url')
+                    source_type = state.get('source_type')
 
-            if not source_url:
-                s_type, s_url = get_or_find_source(_page, today)
+                if not source_url:
+                    s_type, s_url = get_or_find_source(_page, today)
 
-                if s_url:
-                    update_state(
-                        status='streaming',
-                        date=today,
-                        source_type=s_type,
-                        source_url=s_url,
-                    )
-                    source_type = s_type
-                    source_url  = s_url
-                    log.info(f"📡 Source: [{s_type}] {s_url}")
-
-                    # Tell MM we're ready — it will start its refresh timer
-                    signal_mm('ready', {
-                        'source_type': s_type,
-                        'source_url':  s_url,
-                        'status':      'ready',
-                    })
-                else:
-                    retry_sec  = get_retry_interval_sec()
-                    retry_time = datetime.fromtimestamp(
-                        time.time() + retry_sec, tz=timezone.utc
-                    ).isoformat()
-                    update_state(status='no_source', next_retry=retry_time)
-                    log.info(f"📭 No source — notifying MM, waiting for /refresh")
-
-                    # Tell MM we have no source — it decides when to retry
-                    signal_mm('no_source', {'next_retry': retry_time})
-
-                    # Wait indefinitely for MM to trigger a /refresh
-                    _refresh_event.wait()
-                    _refresh_event.clear()
-                    continue
-
-            # scrape
-            try:
-                posts     = scrape_page(_page, source_url, source_type)
-                new_posts = []
-                for p in posts:
-                    if add_post(p):
-                        new_posts.append(p)
-
-                update_state(
-                    status='streaming',
-                    last_refresh=datetime.now(timezone.utc).isoformat(),
-                )
-
-                log.info(f"🔄 [{source_type}] {len(new_posts)} new / {len(posts)} total")
-
-                # Signal MM for each new post — MM decides what to do with them
-                for post in new_posts:
-                    signal_mm('post', post)
-
-                save_session_cookies(_context)
-
-                # Check if liveblog has ended — reset source so we go back to homepage
-                if source_type == 'liveblog':
-                    live_ended = any(p.get('live_ended') for p in posts)
-                    if live_ended:
-                        log.info("🔚 Liveblog ended — resetting source, will scan homepage next cycle")
-                        signal_mm('liveblog_ended', {
-                            'source_url': source_url,
-                            'msg':        'Liveblog ended — switching to tag source',
-                        })
+                    if s_url:
                         update_state(
-                            source_type=None,
-                            source_url=None,
-                            status='searching',
+                            status='streaming',
+                            date=today,
+                            source_type=s_type,
+                            source_url=s_url,
                         )
+                        source_type = s_type
+                        source_url  = s_url
+                        log.info(f"📡 Source: [{s_type}] {s_url}")
+                        signal_mm('ready', {
+                            'source_type': s_type,
+                            'source_url':  s_url,
+                            'status':      'ready',
+                        })
+                    else:
+                        retry_sec  = get_retry_interval_sec()
+                        retry_time = datetime.fromtimestamp(
+                            time.time() + retry_sec, tz=timezone.utc
+                        ).isoformat()
+                        update_state(status='no_source', next_retry=retry_time)
+                        log.info(f"📭 No source — notifying MM, waiting for /refresh")
+                        signal_mm('no_source', {'next_retry': retry_time})
+                        _refresh_event.wait()
+                        _refresh_event.clear()
                         continue
 
-                save_session_cookies(_context)
+                try:
+                    posts     = scrape_page(_page, source_url, source_type)
+                    new_posts = []
+                    for p in posts:
+                        if add_post(p):
+                            new_posts.append(p)
 
-                # hourly liveblog check when on latest_tag —
-                # Bloomberg may start a liveblog mid-morning
-                if source_type == 'latest_tag':
-                    with state_lock:
-                        last_refresh = state.get('last_refresh')
+                    update_state(
+                        status='streaming',
+                        last_refresh=datetime.now(timezone.utc).isoformat(),
+                    )
 
-                    should_check = True
-                    hour            = datetime.now(timezone.utc).hour
-                    check_interval  = 15 if 6 <= hour < 20 else 60
-                    if last_refresh:
-                        try:
-                            last_dt         = datetime.fromisoformat(last_refresh)
-                            mins_since      = (datetime.now(timezone.utc) - last_dt).total_seconds() / 60
-                            should_check    = mins_since >= check_interval
-                        except Exception:
-                            pass
+                    log.info(f"🔄 [{source_type}] {len(new_posts)} new / {len(posts)} total")
 
-                    if should_check:
-                        log.info(f"🔍 Liveblog check (every {check_interval}min)...")
-                        liveblog = find_liveblog_on_homepage(_page, today)
-                        if liveblog:
-                            log.info("🎉 Liveblog appeared — switching!")
-                            update_state(source_type='liveblog', source_url=liveblog)
-                            # Tell MM about the source switch
-                            signal_mm('ready', {
-                                'source_type': 'liveblog',
-                                'source_url':  liveblog,
-                                'status':      'switched',
+                    for post in new_posts:
+                        signal_mm('post', post)
+
+                    save_session_cookies(_context)
+
+                    if source_type == 'liveblog':
+                        live_ended = any(p.get('live_ended') for p in posts)
+                        if live_ended:
+                            log.info("🔚 Liveblog ended — resetting source, will scan homepage next cycle")
+                            signal_mm('liveblog_ended', {
+                                'source_url': source_url,
+                                'msg':        'Liveblog ended — switching to tag source',
                             })
+                            update_state(
+                                source_type=None,
+                                source_url=None,
+                                status='searching',
+                            )
+                            continue
 
-                # recycle page every N cycles to free renderer memory
-                scrape_cycle += 1
-                if scrape_cycle % PAGE_RECYCLE_CYCLES == 0:
-                    recycle_page(_context, session)
+                    save_session_cookies(_context)
 
-            except Exception as e:
-                log_error(f"Scrape cycle error: {e}")
-                update_state(status='error')
-                signal_mm('error', {'msg': str(e)})
+                    # dynamic liveblog check when on latest_tag —
+                    # Bloomberg may start a liveblog at any time during market hours
+                    if source_type == 'latest_tag':
+                        with state_lock:
+                            last_liveblog_check = state.get('last_liveblog_check')
 
-            # No internal timer — wait for MM to trigger next /refresh
-            log.info("⏳ Waiting for next /refresh from MonsieurMarket...")
-            _refresh_event.wait()
-            _refresh_event.clear()
+                        should_check   = True
+                        hour           = datetime.now(timezone.utc).hour
+                        check_interval = 15 if 6 <= hour < 20 else 60
+
+                        if last_liveblog_check:
+                            try:
+                                last_dt      = datetime.fromisoformat(last_liveblog_check)
+                                mins_since   = (datetime.now(timezone.utc) - last_dt).total_seconds() / 60
+                                should_check = mins_since >= check_interval
+                            except Exception:
+                                pass
+
+                        if should_check:
+                            log.info(f"🔍 Liveblog check (every {check_interval}min)...")
+                            update_state(last_liveblog_check=datetime.now(timezone.utc).isoformat())
+                            liveblog = find_liveblog_on_homepage(_page, today)
+                            if liveblog:
+                                log.info("🎉 Liveblog appeared — switching!")
+                                update_state(source_type='liveblog', source_url=liveblog)
+                                signal_mm('ready', {
+                                    'source_type': 'liveblog',
+                                    'source_url':  liveblog,
+                                    'status':      'switched',
+                                })
+
+                    scrape_cycle += 1
+                    if scrape_cycle % PAGE_RECYCLE_CYCLES == 0:
+                        recycle_page(_context, session)
+
+                except Exception as e:
+                    log_error(f"Scrape cycle error: {e}")
+                    update_state(status='error')
+                    signal_mm('error', {'msg': str(e)})
+
+                log.info("⏳ Waiting for next /refresh from MonsieurMarket...")
+                _refresh_event.wait()
+                _refresh_event.clear()
+
+    except Exception as e:
+        log.error(f"🔴 BrowserLoop crashed: {e}")
+        signal_mm('error', {'msg': f"BrowserLoop crashed: {e}"})
 
 
 # ─────────────────────────────────────────────
