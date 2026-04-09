@@ -982,7 +982,7 @@ def browser_loop():
                     if source_type == 'liveblog':
                         is_active, updated_text = _check_liveblog_still_active(_page)
                         if not is_active:
-                            log.info(f"🔚 Liveblog inactive ({updated_text}) — back to homepage")
+                            log.info(f"🔚 Liveblog inactive ({updated_text})")
                             signal_mm('liveblog_ended', {
                                 'source_url': source_url,
                                 'msg': f'Liveblog inactive: {updated_text}',

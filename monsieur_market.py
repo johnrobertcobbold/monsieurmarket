@@ -556,10 +556,7 @@ class BloombergScheduler:
         self.cancel()
         retry_sec = self._interval_sec()
         log.info(f"Bloomberg scheduler: no source — retrying in {retry_sec // 60} min")
-        with self._lock:
-            self._timer = threading.Timer(retry_sec, self._trigger_refresh)
-            self._timer.daemon = True
-            self._timer.start()
+        self._schedule_in(retry_sec)
 
     def trigger_now(self, reason: str = ''):
         if not self._ready:
@@ -578,10 +575,7 @@ class BloombergScheduler:
     def _schedule_next(self):
         interval = self._interval_sec()
         log.info(f"Bloomberg scheduler: next refresh in {interval // 60} min")
-        with self._lock:
-            self._timer = threading.Timer(interval, self._trigger_refresh)
-            self._timer.daemon = True
-            self._timer.start()
+        self._schedule_in(interval)
 
     def _trigger_refresh(self):
         threading.Thread(target=self._do_refresh, daemon=True).start()
@@ -595,7 +589,25 @@ class BloombergScheduler:
         except Exception as e:
             log.warning(f"Bloomberg scheduler: /refresh failed: {e}")
         finally:
-            self._schedule_next()
+            if self._ready:
+                self._schedule_next()
+            # else: on_no_source() or on_liveblog_ended() will re-schedule
+            # based on the signal MM receives back from the monitor
+
+    def _schedule_in(self, seconds: int):
+        """Schedule a single refresh after a fixed delay."""
+        with self._lock:
+            self._timer = threading.Timer(seconds, self._trigger_refresh)
+            self._timer.daemon = True
+            self._timer.start()
+
+    def on_liveblog_ended(self, cooldown_min: int = 10):
+        """Wait before retrying — old liveblog may still be on homepage."""
+        self._ready = False
+        self.cancel()
+        cooldown_sec = cooldown_min * 60
+        log.info(f"Bloomberg scheduler: liveblog ended — retrying homepage in {cooldown_min}min")
+        self._schedule_in(cooldown_sec)
 
     def _interval_sec(self) -> int:
         now  = datetime.now(timezone.utc)
@@ -689,11 +701,11 @@ def _handle_bloomberg_signal(stype: str, data: dict):
         bloomberg_scheduler.on_no_source()
 
     elif stype == 'liveblog_ended':
-        log.info("Bloomberg: liveblog ended — monitor will scan homepage next cycle")
-        bloomberg_scheduler.on_no_source()
+        log.info("Bloomberg: liveblog ended")
+        bloomberg_scheduler.on_liveblog_ended() 
         send_message(
             "📰 <b>Bloomberg liveblog ended</b>\n"
-            "Switching back to tag source — monitor scanning homepage.\n"
+            "Will attempt to scan homepage.\n"
             f"⏰ {datetime.now().strftime('%d/%m %H:%M')}"
         )
 
