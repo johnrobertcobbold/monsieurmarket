@@ -47,22 +47,49 @@ def _save_state(state: dict):
 def _fetch_trump_posts() -> list[dict]:
     """Fetch latest Trump Truth Social posts from RSS mirror."""
     try:
-        r = requests.get(TRUMP_RSS, timeout=8, headers={
-            "User-Agent": "Mozilla/5.0 (compatible; MonsieurMarket/1.0)"
-        })
+        r = requests.get(
+            TRUMP_RSS,
+            timeout=8,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; MonsieurMarket/1.0)"}
+        )
         r.raise_for_status()
-        items = re.findall(r"<item>(.*?)</item>", r.text, re.DOTALL)
+
+        items = re.findall(r"<item\b.*?>(.*?)</item>", r.text, re.DOTALL | re.IGNORECASE)
         posts = []
+
         for item in items[:10]:
-            title_m = re.search(r"<title><!\[CDATA\[(.*?)\]\]></title>", item, re.DOTALL)
-            link_m  = re.search(r"<link>(.*?)</link>", item)
-            title   = title_m.group(1).strip() if title_m else ""
-            url     = link_m.group(1).strip()  if link_m  else ""
-            if title and url:
-                posts.append({"url": url, "title": title})
+            title_m = re.search(
+                r"<title><!\[CDATA\[(.*?)\]\]></title>|<title>(.*?)</title>",
+                item,
+                re.DOTALL | re.IGNORECASE,
+            )
+            link_m = re.search(r"<link>(.*?)</link>", item, re.DOTALL | re.IGNORECASE)
+            guid_m = re.search(r"<guid.*?>(.*?)</guid>", item, re.DOTALL | re.IGNORECASE)
+
+            title = ""
+            if title_m:
+                title = (title_m.group(1) or title_m.group(2) or "").strip()
+
+            url = ""
+            if link_m:
+                url = link_m.group(1).strip()
+            elif guid_m:
+                url = guid_m.group(1).strip()
+
+            if url:
+                posts.append({
+                    "url": url,
+                    "title": title or "[media/no text post]"
+                })
+
+        log.info(f"Trump RSS: fetched {len(posts)} parseable post(s)")
+        if posts:
+            log.info(f"Trump RSS latest: {posts[0]['url']} | {posts[0]['title'][:80]}")
+
         return posts
+
     except Exception as e:
-        log.debug(f"Trump RSS fetch error: {e}")
+        log.warning(f"Trump RSS fetch error: {e}")
         return []
 
 
@@ -96,6 +123,7 @@ def _trump_watcher_worker():
             posts     = _fetch_trump_posts()
 
             if not posts:
+                log.warning("Trump watcher: feed returned 0 parseable posts")                
                 time.sleep(POLL_INTERVAL)
                 continue
 
@@ -106,7 +134,7 @@ def _trump_watcher_worker():
                 new_posts.append(post)
 
             if not new_posts:
-                log.debug("Trump watcher: no new posts")
+                log.info(f"Trump watcher: no new posts (last_seen={last_seen})")
                 time.sleep(POLL_INTERVAL)
                 continue
 
