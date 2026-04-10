@@ -9,7 +9,6 @@ import os
 import time
 import math
 import logging
-from collections import deque
 
 log = logging.getLogger('MonsieurMarket')
 
@@ -36,41 +35,6 @@ def register_tick_callback(fn):
 # ─────────────────────────────────────────────
 # PRICE STATE — rolling tick history
 # ─────────────────────────────────────────────
-class PriceState:
-    def __init__(self):
-        self.last_alert_time = 0
-        self.tick_history    = deque()
-
-    def add_tick(self, mid: float):
-        now = time.time()
-        self.tick_history.append((now, mid))
-        cutoff = now - 15 * 60
-        while self.tick_history and self.tick_history[0][0] < cutoff:
-            self.tick_history.popleft()
-
-    def change_pct_over_window(self, window_min: float) -> float | None:
-        if len(self.tick_history) < 2:
-            return None
-        now          = time.time()
-        cutoff       = now - window_min * 60
-        window_ticks = [t for t in self.tick_history if t[0] >= cutoff]
-        if len(window_ticks) < 2:
-            return None
-        oldest = window_ticks[0][1]
-        latest = window_ticks[-1][1]
-        return (latest - oldest) / oldest * 100 if oldest else None
-
-    def rolling_change_pct(self) -> float | None:
-        return self.change_pct_over_window(10)
-
-    def can_alert(self, cooldown_min: float) -> bool:
-        return (time.time() - self.last_alert_time) > cooldown_min * 60
-
-    def mark_alerted(self):
-        self.last_alert_time = time.time()
-
-
-price_state = PriceState()
 _tick_count  = 0
 
 
@@ -103,8 +67,6 @@ def _on_brent_tick(ticker):
         mid = day_open
     else:
         return
-
-    price_state.add_tick(mid)
 
     global _tick_count
     _tick_count += 1

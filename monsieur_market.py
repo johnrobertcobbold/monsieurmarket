@@ -36,7 +36,8 @@ from config import CONFIG
 from telegram import send_message, format_bloomberg_post, start_telegram_receiver
 from trumpstruth import start_trump_watcher
 from ig import get_ig_service, check_ig_brent, format_ig_block
-from ig import start_price_watcher, register_tick_callback, price_state
+from ig import start_price_watcher, register_tick_callback
+from core import PriceState
 from ig import open_straddle, close_straddle
 
 from dotenv import load_dotenv
@@ -76,6 +77,7 @@ log = logging.getLogger("MonsieurMarket")
 # STATE
 # ─────────────────────────────────────────────
 STATE_FILE = Path("data/monsieur_market_state.json")
+price_state = PriceState()
 
 
 def load_state() -> dict:
@@ -113,6 +115,25 @@ def clean_state(state: dict) -> dict:
         if now - v < window
     }
     return state
+
+
+# ─────────────────────────────────────────────
+# NEWS REFRESH ORCHESTRATION
+# ─────────────────────────────────────────────
+def refresh_news(sources: list[str], reason: str = ""):
+    """Central news-refresh dispatcher."""
+    # Additional sources can be plugged in here later
+    # (e.g. maritime alerts, curated feeds, RSS).
+    for source in sources:
+        if source == "bloomberg":
+            bloomberg_scheduler.trigger_now(reason=reason)
+        elif source == "rss":
+            log.info(
+                "News refresh requested for RSS%s, but RSS polling is currently disabled",
+                f" ({reason})" if reason else "",
+            )
+        else:
+            log.warning(f"Unknown news refresh source requested: {source}")
 
 
 # ─────────────────────────────────────────────
@@ -476,46 +497,61 @@ Keep it punchy and actionable. No fluff."""
 # ─────────────────────────────────────────────
 def _on_brent_price(mid, bid, ask, day_pct, day_open, day_high, day_low):
     """MM's reaction to every Brent tick."""
+
+    price_state.add_tick(mid)
+
     if event_watcher is not None:
         event_watcher.on_tick(mid)
 
     cfg = CONFIG["price_watcher"]
-    if not price_state.can_alert(cfg["cooldown_min"]):
-        return
 
     def valid(v):
         return v is not None and v != 0
 
     alert_reason = None
-    alert_emoji  = ""
+    alert_emoji = ""
+    alert_key = None
 
-    # Trigger 1 — big move from day open
-    if valid(day_pct) and abs(day_pct) >= cfg["trigger_pct_from_open"]:
-        direction    = "📈 UP" if day_pct > 0 else "📉 DOWN"
+    # Trigger 1 — multi-window rolling moves (shortest window wins)
+    for rule in cfg["rolling_windows"]:
+        chg = price_state.change_pct_over_window(rule["minutes"])
+        if chg is None or abs(chg) < rule["threshold_pct"]:
+            continue
+
+        if not price_state.can_alert(rule["key"], rule["cooldown_min"]):
+            continue
+
+        direction = "📈 UP" if chg > 0 else "📉 DOWN"
+        alert_reason = (
+            f"Brent {direction} <b>{chg:+.2f}%</b> in last {rule['label']}"
+            f" → {mid:.2f}"
+        )
+        alert_emoji = "⚡" if rule["minutes"] <= 1 else "⚠️" if rule["minutes"] <= 5 else "📊"
+        alert_key = rule["key"]
+        break
+
+    # Trigger 2 — big move from day open
+    from_open_cfg = cfg["from_open"]
+    if (
+        alert_reason is None
+        and from_open_cfg["enabled"]
+        and valid(day_pct)
+        and abs(day_pct) >= from_open_cfg["threshold_pct"]
+        and price_state.can_alert(from_open_cfg["key"], from_open_cfg["cooldown_min"])
+    ):
+        direction = "📈 UP" if day_pct > 0 else "📉 DOWN"
         alert_reason = (
             f"Brent {direction} <b>{day_pct:+.2f}%</b> from today's open"
             f" ({day_open:.2f} → {mid:.2f})"
         )
         alert_emoji = "🚨"
+        alert_key = from_open_cfg["key"]
 
-    # Trigger 2 — multi-window rolling moves (shortest window wins)
-    for (window_min, threshold_pct, label) in cfg["rolling_windows"]:
-        chg = price_state.change_pct_over_window(window_min)
-        if chg is not None and abs(chg) >= threshold_pct:
-            direction   = "📈 UP" if chg > 0 else "📉 DOWN"
-            rolling_msg = (
-                f"Brent {direction} <b>{chg:+.2f}%</b> in last {label}"
-                f" → {mid:.2f}"
-            )
-            if alert_reason is None:
-                alert_reason = rolling_msg
-                alert_emoji  = "⚡" if window_min <= 1 else "⚠️" if window_min <= 5 else "📊"
-            break
-
+    # This callback runs on every tick; only continue when a price alert was triggered.
     if not alert_reason:
         return
 
-    now_str    = datetime.now().strftime("%d/%m %H:%M")
+    now_str = datetime.now().strftime("%d/%m %H:%M")
     price_line = (
         f"Bid: {bid:.2f}  Ask: {ask:.2f}\n"
         if valid(bid) and valid(ask)
@@ -532,9 +568,9 @@ def _on_brent_price(mid, bid, ask, day_pct, day_open, day_high, day_low):
         f"{price_line}{range_line}"
         f"\n⏰ {now_str}"
     )
-    price_state.mark_alerted()
-    log.info(f"Price alert sent — {alert_reason[:60]}")
-    bloomberg_scheduler.trigger_now(reason=alert_reason[:60])
+    price_state.mark_alerted(alert_key)
+    log.info(f"Price alert sent [{alert_key}] — {alert_reason[:60]}")
+    refresh_news(CONFIG.get("news_refresh", {}).get("price_alert_sources", ["bloomberg"]), reason=alert_reason[:60])
 
 
 # ─────────────────────────────────────────────
@@ -702,7 +738,7 @@ def _handle_bloomberg_signal(stype: str, data: dict):
 
     elif stype == 'liveblog_ended':
         log.info("Bloomberg: liveblog ended")
-        bloomberg_scheduler.on_liveblog_ended() 
+        bloomberg_scheduler.on_liveblog_ended()
         send_message(
             "📰 <b>Bloomberg liveblog ended</b>\n"
             "Will attempt to scan homepage.\n"
@@ -841,14 +877,12 @@ def _handle_telegram_signal(stype: str, data: dict):
     elif stype == 'discover':
         svc = get_ig_service()
         try:
-            # fetch market navigation nodes
             result = svc.fetch_top_level_navigation_nodes()
             log.info(f"top level nodes: {result}")
         except Exception as e:
             log.error(f"top nodes failed: {e}")
-    
+
         try:
-            # try with known knockout epic format variations
             for epic in [
                 'CC.D.LCO.OPTCALL.IP.9000',
                 'KO.D.LCO.CALL.9000.IP',
@@ -915,174 +949,6 @@ def _send_status():
         "No open positions\n"
         "(not yet implemented)"
     )
-
-
-# ─────────────────────────────────────────────
-# POLLING LOOP (disabled — too expensive)
-# ─────────────────────────────────────────────
-def fetch_rss_headlines(state: dict) -> tuple[list[dict], dict]:
-    sources = [
-        {"name": "Reuters",    "url": "https://feeds.reuters.com/reuters/topNews"},
-        {"name": "Al Jazeera", "url": "https://www.aljazeera.com/xml/rss/all.xml"},
-        {"name": "OilPrice",   "url": "https://oilprice.com/rss/main"},
-        {"name": "CNBC",       "url": "https://www.cnbc.com/id/100003114/device/rss/rss.html"},
-        {"name": "CNN",        "url": "http://rss.cnn.com/rss/cnn_latest.rss"},
-    ]
-    headlines = []
-    for source in sources:
-        try:
-            import re as _re
-            r = requests.get(source["url"], timeout=8, headers={
-                "User-Agent": "Mozilla/5.0 (compatible; MonsieurMarket/1.0)"
-            })
-            items = _re.findall(r"<item>(.*?)</item>", r.text, _re.DOTALL)
-            for item in items[:20]:
-                title_m = _re.search(r"<title><!\[CDATA\[(.*?)\]\]></title>|<title>(.*?)</title>", item)
-                link_m  = _re.search(r"<link>(.*?)</link>|<guid>(.*?)</guid>", item)
-                title   = (title_m.group(1) or title_m.group(2) or "").strip() if title_m else ""
-                url     = (link_m.group(1)  or link_m.group(2)  or "").strip() if link_m  else ""
-                if title and url and url not in state["seen_news_urls"]:
-                    headlines.append({"title": title, "url": url, "source": source["name"]})
-        except Exception as e:
-            log.debug(f"RSS fetch error {source['name']}: {e}")
-    return headlines, state
-
-
-def run_poll():
-    log.info("── Poll cycle starting ──")
-    state = load_state()
-    state = clean_state(state)
-
-    ig_data = check_ig_brent()
-
-    if ig_data and ig_data.get("barrier_warning"):
-        send_message(
-            f"⚠️ <b>Brent Barrier Proximity Alert</b>\n"
-            f"Knock-out at <b>{ig_data['knock_out_level']:.2f}</b> — "
-            f"only {ig_data['barrier_distance_pct']:.1f}% away\n"
-            f"Current mid: {ig_data['mid']:.2f}  "
-            f"({ig_data['net_chg_pct']:+.2f}% today)\n"
-            f"⏰ {datetime.now().strftime('%d/%m %H:%M')}"
-        )
-
-    whale_signals, state = check_polymarket(state)
-    if whale_signals:
-        log.info(f"Polymarket: {len(whale_signals)} new whale signal(s)")
-
-    whale_agg_global     = aggregate_whale_signals(
-        [s for s in whale_signals if s.get("type") == "whale_trade"]
-    )
-    cfg_wt               = CONFIG["whale_triggers"]
-    whale_flow_trigger   = False
-    whale_trigger_reason = ""
-
-    if whale_signals:
-        max_single = max(
-            (s.get("amount", 0) for s in whale_signals if s.get("type") == "whale_trade"),
-            default=0
-        )
-        if max_single >= cfg_wt["single_trade_usd"]:
-            whale_flow_trigger   = True
-            whale_trigger_reason = f"single trade ${max_single:,.0f}"
-
-        if not whale_flow_trigger and whale_agg_global.get("top_traders"):
-            top = whale_agg_global["top_traders"][0]
-            if top["total_usd"] >= cfg_wt["single_trader_usd"]:
-                whale_flow_trigger   = True
-                whale_trigger_reason = f"{top['name']} cumulative ${top['total_usd']:,.0f}"
-
-        if not whale_flow_trigger:
-            total = whale_agg_global.get("total_volume_usd", 0)
-            net   = abs(whale_agg_global.get("net_yes_usd", 0))
-            if (total >= cfg_wt["net_flow_usd"] and
-                    total > 0 and net / total >= cfg_wt["net_flow_min_pct"]):
-                whale_flow_trigger   = True
-                direction            = whale_agg_global.get("dominant_side", "?")
-                whale_trigger_reason = f"${total:,.0f} total, {net/total*100:.0f}% {direction}"
-
-    if whale_flow_trigger:
-        log.info(f"🐋 Whale trigger: {whale_trigger_reason}")
-
-    state, repeat_whale_alerts = update_whale_ledger(state, whale_signals)
-    if repeat_whale_alerts:
-        msg = format_repeat_whale_alert(repeat_whale_alerts, market="US forces enter Iran")
-        if msg:
-            send_message(msg)
-            whale_flow_trigger = True
-            if not whale_trigger_reason:
-                whale_trigger_reason = f"{len(repeat_whale_alerts)} repeat whale(s) crossed ${WHALE_REPEAT_TRIGGER:,} threshold"
-
-        for alert in repeat_whale_alerts:
-            proxy  = alert.get("proxy_wallet", "")
-            trader = alert.get("trader", "")
-            if proxy:
-                threading.Thread(
-                    target=run_portfolio_check,
-                    args=(trader, proxy, send_message),
-                    daemon=True,
-                ).start()
-
-    poll_interval_sec = CONFIG["poll_interval_minutes"] * 60
-    time_since_last   = time.time() - state.get("last_news_poll", 0)
-    force_news        = whale_flow_trigger or bool(
-        price_state.tick_history and
-        abs(price_state.rolling_change_pct() or 0) >= CONFIG["price_watcher"]["trigger_pct_from_open"]
-    )
-
-    if time_since_last < poll_interval_sec and not force_news:
-        all_headlines = []
-    else:
-        if force_news and time_since_last < poll_interval_sec:
-            log.info("RSS: forced fetch — active price/whale trigger")
-        all_headlines, state    = fetch_rss_headlines(state)
-        state["last_news_poll"] = time.time()
-        log.info(f"RSS: {len(all_headlines)} new headlines")
-
-    for theme in CONFIG["themes"]:
-        if not theme.get("active"):
-            continue
-
-        theme_name         = theme["name"]
-        relevant_headlines = haiku_filter_news(all_headlines, theme)
-
-        if not relevant_headlines and not whale_flow_trigger:
-            continue
-
-        analysis = sonnet_analyze(relevant_headlines, whale_signals, theme)
-        if not analysis:
-            continue
-
-        score = analysis.get("score", 0)
-        if score < CONFIG["alert_threshold"]:
-            for h in relevant_headlines:
-                state["seen_news_urls"][h["url"]] = time.time()
-            continue
-
-        trigger_parts = []
-        if relevant_headlines:
-            trigger_parts.append(f"{len(relevant_headlines)} news signal(s)")
-        if whale_trigger_reason:
-            trigger_parts.append(whale_trigger_reason)
-        trigger_str = " + ".join(trigger_parts) if trigger_parts else "scheduled poll"
-
-        message = format_alert(
-            theme, analysis, relevant_headlines, whale_signals, ig_data,
-            trigger_reason=trigger_str,
-        )
-        send_message(message)
-
-        for h in relevant_headlines:
-            state["seen_news_urls"][h["url"]] = time.time()
-
-        state["weekly_signals"].append({
-            "theme":     theme_name,
-            "score":     score,
-            "summary":   analysis.get("summary", ""),
-            "timestamp": datetime.now().isoformat(),
-        })
-
-    save_state(state)
-    log.info("── Poll cycle complete ──")
 
 
 # ─────────────────────────────────────────────

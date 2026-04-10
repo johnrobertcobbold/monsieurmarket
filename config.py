@@ -20,15 +20,44 @@ CONFIG = {
     # ── POLYMARKET ───────────────────────────────────────────────────────────
     "polymarket_markets_file": "polymarket/polymarket_markets.json",
 
+    # ── NEWS REFRESH ROUTING ─────────────────────────────────────────────────
+    "news_refresh": {
+        # Live price alerts currently refresh Bloomberg only.
+        # Additional sources (e.g. maritime alerts, curated feeds, RSS) can be added later.
+        "price_alert_sources": ["bloomberg"],
+    },    
+
     # ── PRICE WATCHER ────────────────────────────────────────────────────────
     "price_watcher": {
-        "enabled":               True,
-        "trigger_pct_from_open": 1.5,
-        "cooldown_min":          15,
+        "enabled": True,
+        "from_open": {
+            "enabled": True,
+            "threshold_pct": 1.5,
+            "cooldown_min": 30,
+            "key": "from_open",
+        },
         "rolling_windows": [
-            (1,  1.0,  "1min"),
-            (5,  1.0,  "5min"),
-            (10, 1.5,  "10min"),
+            {
+                "key": "rolling_1m",
+                "minutes": 1,
+                "threshold_pct": 1.0,
+                "label": "1min",
+                "cooldown_min": 5,
+            },
+            {
+                "key": "rolling_5m",
+                "minutes": 5,
+                "threshold_pct": 1.0,
+                "label": "5min",
+                "cooldown_min": 10,
+            },
+            {
+                "key": "rolling_10m",
+                "minutes": 10,
+                "threshold_pct": 1.5,
+                "label": "10min",
+                "cooldown_min": 15,
+            },
         ],
     },
 
