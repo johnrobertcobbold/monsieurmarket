@@ -14,16 +14,21 @@ Flow:
     7. Scrape headlines with UTC timestamps
     8. Wait for /refresh calls from MonsieurMarket (no internal timer)
 
-Memory fix:
-    - Page object is closed and recreated every PAGE_RECYCLE_CYCLES scrape
-      cycles. This kills the renderer process and lets the OS reclaim its
-      heap. page.reload() does NOT do this — the process stays alive.
+Behavior updates:
+    - Homepage is a temporary probe page, not a resting place.
+    - After a failed homepage liveblog probe, browser returns to the current
+      valid source page.
+    - After page recycle, browser reopens the current valid source page.
+    - Ended liveblogs are put on a short per-URL cooldown so we don't loop
+      homepage → dead liveblog → homepage, but we still retry later because
+      Bloomberg may re-open the same URL.
 
 Signal flow:
     monitor → POST /signal to MonsieurMarket on:
         - startup ready (source found)
         - no_source (MM decides when to retry)
         - new posts found after /refresh
+        - liveblog_ended
         - error
 
     MonsieurMarket → GET /refresh to trigger a scrape
@@ -97,6 +102,7 @@ CONFIG = {
         'iran', 'oil', 'houthi', 'war', 'energy',
         'opec', 'hormuz', 'brent', 'crude', 'red sea',
     ],
+    'ended_liveblog_cooldown_min': 15,
 }
 
 # How many scrape cycles before we close + recreate the page object.
@@ -112,7 +118,7 @@ def signal_mm(signal_type: str, data: dict, retries: int = 5, delay: int = 3):
     POST a signal to MonsieurMarket's /signal endpoint.
     Retries with backoff in case MM isn't up yet (startup race condition).
 
-    signal_type: 'ready' | 'no_source' | 'post' | 'error'
+    signal_type: 'ready' | 'no_source' | 'post' | 'liveblog_ended' | 'error'
     data: signal-specific payload
     """
     payload = {
@@ -149,9 +155,12 @@ def load_persistent_state() -> dict:
                 f"({saved.get('tag_set_date')})"
             )
             return {
-                'latest_tag_url':  saved.get('latest_tag_url'),
-                'latest_tag_name': saved.get('latest_tag_name'),
-                'tag_set_date':    saved.get('tag_set_date'),
+                'latest_tag_url':      saved.get('latest_tag_url'),
+                'latest_tag_name':     saved.get('latest_tag_name'),
+                'tag_set_date':        saved.get('tag_set_date'),
+                'ended_liveblogs':     saved.get('ended_liveblogs', {}),
+                'last_valid_source_url':  saved.get('last_valid_source_url'),
+                'last_valid_source_type': saved.get('last_valid_source_type'),
             }
     except Exception as e:
         log.debug(f"Persistent state load failed: {e}")
@@ -162,9 +171,12 @@ def save_persistent_state():
     try:
         with state_lock:
             to_save = {
-                'latest_tag_url':  state.get('latest_tag_url'),
-                'latest_tag_name': state.get('latest_tag_name'),
-                'tag_set_date':    state.get('tag_set_date'),
+                'latest_tag_url':         state.get('latest_tag_url'),
+                'latest_tag_name':        state.get('latest_tag_name'),
+                'tag_set_date':           state.get('tag_set_date'),
+                'ended_liveblogs':        state.get('ended_liveblogs', {}),
+                'last_valid_source_url':  state.get('last_valid_source_url'),
+                'last_valid_source_type': state.get('last_valid_source_type'),
             }
         STATE_FILE.write_text(json.dumps(to_save, indent=2))
         log.debug("💾 Persistent state saved")
@@ -204,9 +216,12 @@ state = {
     'tag_set_date':         None,
     'next_retry':           None,
     'errors':               [],
+    'ended_liveblogs':      {},
+    'last_valid_source_url':  None,
+    'last_valid_source_type': None,
 }
 
-# restore persisted tag fields on startup
+# restore persisted fields on startup
 state.update(load_persistent_state())
 
 state_lock           = threading.Lock()
@@ -218,9 +233,21 @@ _context             = None
 
 
 def update_state(**kwargs):
+    persist_needed = any(
+        k in kwargs for k in (
+            'latest_tag_url',
+            'latest_tag_name',
+            'tag_set_date',
+            'ended_liveblogs',
+            'last_valid_source_url',
+            'last_valid_source_type',
+        )
+    )
     with state_lock:
         state.update(kwargs)
     save_feed()
+    if persist_needed:
+        save_persistent_state()
 
 
 def save_feed():
@@ -312,6 +339,70 @@ def parse_relative_time(timestamp_text: str, scraped_at: datetime) -> str:
         pass
 
     return timestamp_text
+
+
+# ─────────────────────────────────────────────
+# LIVEBLOG COOLDOWN HELPERS
+# ─────────────────────────────────────────────
+def _prune_ended_liveblogs(ended_map: dict | None = None) -> dict:
+    """Drop cooldown entries older than 24h."""
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=24)
+
+    if ended_map is None:
+        with state_lock:
+            ended_map = dict(state.get('ended_liveblogs', {}))
+
+    pruned = {}
+    for url, meta in ended_map.items():
+        try:
+            ended_at = datetime.fromisoformat(meta.get('ended_at'))
+            if ended_at >= cutoff:
+                pruned[url] = meta
+        except Exception:
+            continue
+    return pruned
+
+
+def get_ended_liveblogs() -> dict:
+    with state_lock:
+        ended_map = _prune_ended_liveblogs(state.get('ended_liveblogs', {}))
+        if ended_map != state.get('ended_liveblogs', {}):
+            state['ended_liveblogs'] = ended_map
+            save_feed()
+            save_persistent_state()
+        return dict(ended_map)
+
+
+def mark_liveblog_ended(url: str, reason: str = ''):
+    cooldown_min = CONFIG.get('ended_liveblog_cooldown_min', 15)
+    now = datetime.now(timezone.utc)
+    retry_after = now + timedelta(minutes=cooldown_min)
+
+    ended_map = get_ended_liveblogs()
+    ended_map[url] = {
+        'ended_at': now.isoformat(),
+        'retry_after': retry_after.isoformat(),
+        'reason': reason,
+    }
+    update_state(ended_liveblogs=ended_map)
+    log.info(f"🧊 Cooldown liveblog for {cooldown_min}min: {url}")
+
+
+def is_liveblog_on_cooldown(url: str) -> tuple[bool, str]:
+    ended_map = get_ended_liveblogs()
+    meta = ended_map.get(url)
+    if not meta:
+        return False, ''
+
+    try:
+        retry_after = datetime.fromisoformat(meta['retry_after'])
+        if retry_after > datetime.now(timezone.utc):
+            return True, meta.get('reason', '')
+    except Exception:
+        return False, ''
+
+    return False, ''
 
 
 # ─────────────────────────────────────────────
@@ -496,64 +587,52 @@ def save_session_cookies(context):
 
 
 # ─────────────────────────────────────────────
+# NAVIGATION HELPERS
+# ─────────────────────────────────────────────
+def navigate_to_source(page, source_url: str, source_type: str, *, force: bool = False) -> bool:
+    """Navigate to the canonical source page if needed."""
+    try:
+        if not force and page.url == source_url:
+            return True
+
+        if source_type == 'liveblog':
+            page.goto(source_url, timeout=30000, wait_until='domcontentloaded')
+            page.wait_for_timeout(3000)
+        else:
+            page.goto(source_url, timeout=30000, wait_until='networkidle')
+            page.wait_for_timeout(1000)
+
+        # Human-like scroll after navigation — helps bypass bot detection
+        # and ensures lazy-loaded content is triggered before scraping.
+        page.mouse.wheel(0, random.randint(200, 600))
+        page.wait_for_timeout(random.randint(800, 2000))
+        return True
+    except Exception as e:
+        log_error(f"Navigation failed ({source_type}): {e}")
+        return False
+
+
+def restore_source_page(page, source_url: str | None, source_type: str | None) -> bool:
+    """Return the visible browser to the current valid monitored source."""
+    if not source_url or not source_type:
+        return False
+    log.info(f"↩️ Returning to current source: [{source_type}] {source_url}")
+    return navigate_to_source(page, source_url, source_type, force=True)
+
+
+def set_current_source(source_type: str, source_url: str, *, status: str = 'streaming'):
+    update_state(
+        status=status,
+        source_type=source_type,
+        source_url=source_url,
+        last_valid_source_type=source_type,
+        last_valid_source_url=source_url,
+    )
+
+
+# ─────────────────────────────────────────────
 # HOMEPAGE SCAN
 # ─────────────────────────────────────────────
-def find_liveblog_on_homepage(page, date: str) -> str | None:
-    try:
-        log.info("🏠 Opening Bloomberg homepage...")
-        page.goto(
-            'https://www.bloomberg.com',
-            timeout=20000,
-            wait_until='domcontentloaded',
-        )
-        page.wait_for_timeout(2000)
-
-        all_liveblogs = page.evaluate("""() => {
-            return Array.from(document.querySelectorAll('a'))
-                .filter(a => a.href?.includes('live-blog'))
-                .map(a => ({
-                    href: a.href,
-                    text: a.textContent?.trim()?.slice(0, 80),
-                }));
-        }""")
-
-        if all_liveblogs:
-            log.info(f"🔍 All liveblogs on homepage ({len(all_liveblogs)}):")
-            _record_liveblogs(all_liveblogs, date)
-            for lb in all_liveblogs:
-                log.info(f"   [{lb['text']}] → {lb['href']}")
-        else:
-            log.info("🔍 No liveblogs found on homepage at all")
-
-        # today first
-        link = next(
-            (lb['href'] for lb in all_liveblogs if date in lb['href']),
-            None
-        )
-
-        if link:
-            log.info(f"✅ Today's liveblog selected: {link}")
-            return link
-
-        # yesterday's liveblog still featured on homepage = still active
-        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime('%Y-%m-%d')
-        link = next(
-            (lb['href'] for lb in all_liveblogs if yesterday in lb['href']),
-            None
-        )
-
-        if link:
-            log.info(f"📰 Using yesterday's liveblog — still featured on homepage: {link}")
-            return link
-
-        log.info(f"📰 No liveblog found on homepage")
-        return None
-
-    except Exception as e:
-        log_error(f"Homepage scan failed: {e}")
-        return None
-
-
 HISTORY_FILE = BASE_DIR / 'liveblog_history.json'
 
 
@@ -586,6 +665,74 @@ def _record_liveblogs(liveblogs: list, date: str):
 
     except Exception as e:
         log.debug(f"Liveblog history write failed: {e}")
+
+
+def _pick_liveblog_candidate(all_liveblogs: list, date: str) -> str | None:
+    """Prefer today, then yesterday, while skipping URLs on cooldown."""
+    candidates = []
+
+    today_matches = [lb['href'] for lb in all_liveblogs if date in lb['href']]
+    if today_matches:
+        candidates.extend(today_matches)
+
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime('%Y-%m-%d')
+    yesterday_matches = [lb['href'] for lb in all_liveblogs if yesterday in lb['href']]
+    for href in yesterday_matches:
+        if href not in candidates:
+            candidates.append(href)
+
+    for href in candidates:
+        on_cooldown, reason = is_liveblog_on_cooldown(href)
+        if on_cooldown:
+            log.info(f"🧊 Skipping cooled-down liveblog: {href} ({reason or 'recently ended'})")
+            continue
+        return href
+
+    return None
+
+
+def find_liveblog_on_homepage(page, date: str) -> str | None:
+    try:
+        log.info("🏠 Opening Bloomberg homepage...")
+        page.goto(
+            'https://www.bloomberg.com',
+            timeout=20000,
+            wait_until='domcontentloaded',
+        )
+        page.wait_for_timeout(2000)
+
+        all_liveblogs = page.evaluate("""() => {
+            return Array.from(document.querySelectorAll('a'))
+                .filter(a => a.href?.includes('live-blog'))
+                .map(a => ({
+                    href: a.href,
+                    text: a.textContent?.trim()?.slice(0, 80),
+                }));
+        }""")
+
+        if all_liveblogs:
+            log.info(f"🔍 All liveblogs on homepage ({len(all_liveblogs)}):")
+            _record_liveblogs(all_liveblogs, date)
+            for lb in all_liveblogs:
+                log.info(f"   [{lb['text']}] → {lb['href']}")
+        else:
+            log.info("🔍 No liveblogs found on homepage at all")
+
+        link = _pick_liveblog_candidate(all_liveblogs, date)
+
+        if link:
+            if date in link:
+                log.info(f"✅ Today's liveblog selected: {link}")
+            else:
+                log.info(f"📰 Using yesterday's liveblog — still featured on homepage: {link}")
+            return link
+
+        log.info("📰 No eligible liveblog found on homepage")
+        return None
+
+    except Exception as e:
+        log_error(f"Homepage scan failed: {e}")
+        return None
 
 
 # ─────────────────────────────────────────────
@@ -703,6 +850,7 @@ def get_or_find_source(page, date: str) -> tuple[str, str] | tuple[None, None]:
         url = saved_url if not saved_url.startswith('/') \
               else f"https://www.bloomberg.com{saved_url}"
         page.goto(url, timeout=15000, wait_until='domcontentloaded')
+        page.wait_for_timeout(1000)
         return 'latest_tag', saved_url
 
     tag_name, tag_url = pick_best_tag(page)
@@ -713,7 +861,6 @@ def get_or_find_source(page, date: str) -> tuple[str, str] | tuple[None, None]:
             latest_tag_name=tag_name,
             tag_set_date=date,
         )
-        save_persistent_state()
         return 'latest_tag', tag_url
 
     log.warning("⚠️  Could not find any source")
@@ -725,37 +872,17 @@ def get_or_find_source(page, date: str) -> tuple[str, str] | tuple[None, None]:
 # ─────────────────────────────────────────────
 def scrape_page(page, source_url: str, source_type: str) -> list[dict]:
     try:
-        if page.url != source_url:
-            if source_type == 'liveblog':
-                # Liveblogs have constant network activity (SSE streams, analytics
-                # pings, ad beacons) so networkidle never fires — use domcontentloaded
-                # and a fixed pause to let the initial posts render via JS.
-                page.goto(source_url, timeout=30000, wait_until='domcontentloaded')
-                page.wait_for_timeout(3000)
-            else:
-                # Static tag pages go quiet after assets load, so networkidle is
-                # safe and gives _scrape_latest_tag a fully settled DOM to query.
-                # The selector wait inside _scrape_latest_tag adds a second layer
-                # of precision on top of this.
-                page.goto(source_url, timeout=30000, wait_until='networkidle')
-                page.wait_for_timeout(1000)
+        if not navigate_to_source(page, source_url, source_type):
+            return []
 
-            # Human-like scroll after navigation — helps bypass bot detection
-            # and ensures lazy-loaded content is triggered before scraping.
-            page.mouse.wheel(0, random.randint(200, 600))
-            page.wait_for_timeout(random.randint(800, 2000))
-
-        # If page.url already matches source_url (normal polling cycle, or after
-        # recycle_page sets url to about:blank and the previous block re-navigated),
-        # skip navigation entirely and scrape the live DOM directly.
         if source_type == 'liveblog':
             return _scrape_liveblog(page)
-        else:
-            return _scrape_latest_tag(page)
+        return _scrape_latest_tag(page)
 
     except Exception as e:
         log_error(f"Scrape failed ({source_type}): {e}")
         return []
+
 
 def _check_liveblog_still_active(page) -> tuple[bool, str]:
     """
@@ -789,6 +916,7 @@ def _check_liveblog_still_active(page) -> tuple[bool, str]:
 
     except Exception:
         return True, ''
+
 
 def _scrape_liveblog(page) -> list[dict]:
     scraped_at = datetime.now(timezone.utc)
@@ -867,11 +995,13 @@ def _scrape_latest_tag(page) -> list[dict]:
 # ─────────────────────────────────────────────
 # PAGE RECYCLER
 # ─────────────────────────────────────────────
-def recycle_page(context, session: dict):
+def recycle_page(context, session: dict, source_url: str | None = None, source_type: str | None = None):
     """
     Close the current page and open a fresh one.
     Kills the renderer process so the OS reclaims its heap.
     Much cheaper than restarting the whole browser.
+
+    Reopens the current valid source so visible mode remains meaningful.
     """
     global _page
     try:
@@ -881,10 +1011,56 @@ def recycle_page(context, session: dict):
         log.debug(f"Page close error (ignored): {e}")
 
     _page = context.new_page()
-    # Re-inject session cookies so we stay authenticated
     context.add_cookies(session['cookies'])
-    log.info("♻️  Fresh page ready")
+
+    if source_url and source_type:
+        try:
+            navigate_to_source(_page, source_url, source_type, force=True)
+        except Exception as e:
+            log.warning(f"Post-recycle navigation failed: {e}")
+
+    log.info(f"♻️  Fresh page ready at: {_page.url}")
     gc.collect()
+
+
+# ─────────────────────────────────────────────
+# SOURCE RESOLUTION AFTER LIVEBLOG END
+# ─────────────────────────────────────────────
+def resolve_source_after_liveblog_end(page, date: str) -> tuple[str | None, str | None]:
+    """
+    Liveblog just ended. Do NOT return to that ended liveblog.
+    Find the best currently valid source:
+      1) new eligible homepage liveblog
+      2) today's saved latest tag
+      3) new best tag
+    """
+    liveblog = find_liveblog_on_homepage(page, date)
+    if liveblog:
+        return 'liveblog', liveblog
+
+    with state_lock:
+        saved_url  = state.get('latest_tag_url')
+        saved_name = state.get('latest_tag_name')
+        saved_date = state.get('tag_set_date')
+
+    if saved_url and saved_date == date:
+        log.info(f"📌 Falling back to saved tag after liveblog end: {saved_name} → {saved_url}")
+        url = saved_url if not saved_url.startswith('/') \
+              else f"https://www.bloomberg.com{saved_url}"
+        page.goto(url, timeout=15000, wait_until='domcontentloaded')
+        page.wait_for_timeout(1000)
+        return 'latest_tag', saved_url
+
+    tag_name, tag_url = pick_best_tag(page)
+    if tag_url:
+        update_state(
+            latest_tag_url=tag_url,
+            latest_tag_name=tag_name,
+            tag_set_date=date,
+        )
+        return 'latest_tag', tag_url
+
+    return None, None
 
 
 # ─────────────────────────────────────────────
@@ -923,8 +1099,14 @@ def browser_loop():
 
                 if stored_date and stored_date != today:
                     log.info(f"📅 New day ({today}) — resetting source")
-                    update_state(date=None, source_type=None,
-                                 source_url=None, status='searching')
+                    update_state(
+                        date=None,
+                        source_type=None,
+                        source_url=None,
+                        status='searching',
+                        last_valid_source_url=None,
+                        last_valid_source_type=None,
+                    )
 
                 with state_lock:
                     source_url  = state.get('source_url')
@@ -934,14 +1116,18 @@ def browser_loop():
                     s_type, s_url = get_or_find_source(_page, today)
 
                     if s_url:
-                        update_state(
-                            status='streaming',
-                            date=today,
-                            source_type=s_type,
-                            source_url=s_url,
-                        )
+                        set_current_source(s_type, s_url, status='streaming')
                         source_type = s_type
                         source_url  = s_url
+                    
+                        updates = {'date': today}
+                        if s_type == 'latest_tag':
+                            # We just checked the homepage during source discovery,
+                            # so don't immediately do a second homepage probe.
+                            updates['last_liveblog_check'] = datetime.now(timezone.utc).isoformat()
+                    
+                        update_state(**updates)
+                    
                         log.info(f"📡 Source: [{s_type}] {s_url}")
                         signal_mm('ready', {
                             'source_type': s_type,
@@ -954,7 +1140,7 @@ def browser_loop():
                             time.time() + retry_sec, tz=timezone.utc
                         ).isoformat()
                         update_state(status='no_source', next_retry=retry_time)
-                        log.info(f"📭 No source — notifying MM, waiting for /refresh")
+                        log.info("📭 No source — notifying MM, waiting for /refresh")
                         signal_mm('no_source', {'next_retry': retry_time})
                         _refresh_event.wait()
                         _refresh_event.clear()
@@ -970,6 +1156,7 @@ def browser_loop():
                     update_state(
                         status='streaming',
                         last_refresh=datetime.now(timezone.utc).isoformat(),
+                        next_retry=None,
                     )
 
                     log.info(f"🔄 [{source_type}] {len(new_posts)} new / {len(posts)} total")
@@ -983,11 +1170,35 @@ def browser_loop():
                         is_active, updated_text = _check_liveblog_still_active(_page)
                         if not is_active:
                             log.info(f"🔚 Liveblog inactive ({updated_text})")
+                            mark_liveblog_ended(source_url, updated_text)
+
                             signal_mm('liveblog_ended', {
                                 'source_url': source_url,
                                 'msg': f'Liveblog inactive: {updated_text}',
                             })
-                            update_state(source_type=None, source_url=None, status='searching')
+
+                            new_type, new_url = resolve_source_after_liveblog_end(_page, today)
+                            if new_url:
+                                log.info(f"🔁 Switched after ended liveblog → [{new_type}] {new_url}")
+                                set_current_source(new_type, new_url, status='streaming')
+                                update_state(date=today)
+                                signal_mm('ready', {
+                                    'source_type': new_type,
+                                    'source_url':  new_url,
+                                    'status':      'switched_after_liveblog_end',
+                                })
+                            else:
+                                retry_sec  = get_retry_interval_sec()
+                                retry_time = datetime.fromtimestamp(
+                                    time.time() + retry_sec, tz=timezone.utc
+                                ).isoformat()
+                                update_state(
+                                    source_type=None,
+                                    source_url=None,
+                                    status='no_source',
+                                    next_retry=retry_time,
+                                )
+                                signal_mm('no_source', {'next_retry': retry_time})
                             continue
 
                     save_session_cookies(_context)
@@ -1013,19 +1224,28 @@ def browser_loop():
                         if should_check:
                             log.info(f"🔍 Liveblog check (every {check_interval}min)...")
                             update_state(last_liveblog_check=datetime.now(timezone.utc).isoformat())
+
+                            origin_url = source_url
+                            origin_type = source_type
+
                             liveblog = find_liveblog_on_homepage(_page, today)
                             if liveblog:
                                 log.info("🎉 Liveblog appeared — switching!")
-                                update_state(source_type='liveblog', source_url=liveblog)
+                                set_current_source('liveblog', liveblog, status='streaming')
                                 signal_mm('ready', {
                                     'source_type': 'liveblog',
                                     'source_url':  liveblog,
                                     'status':      'switched',
                                 })
+                            else:
+                                restore_source_page(_page, origin_url, origin_type)
 
                     scrape_cycle += 1
                     if scrape_cycle % PAGE_RECYCLE_CYCLES == 0:
-                        recycle_page(_context, session)
+                        with state_lock:
+                            recycle_url = state.get('source_url')
+                            recycle_type = state.get('source_type')
+                        recycle_page(_context, session, recycle_url, recycle_type)
 
                 except Exception as e:
                     log_error(f"Scrape cycle error: {e}")
@@ -1060,6 +1280,7 @@ def health():
             'next_retry':   state['next_retry'],
             'is_today':     state['date'] == datetime.now(timezone.utc).strftime('%Y-%m-%d'),
             'latest_tag':   state.get('latest_tag_name'),
+            'ended_liveblogs': state.get('ended_liveblogs', {}),
             'errors':       state['errors'][-3:],
         })
 
@@ -1142,7 +1363,7 @@ def refresh():
             with state_lock:
                 if state.get('last_refresh') and state.get('last_refresh') != before_refresh:
                     log.info("⚡ Refresh complete — scraper responded")
-                    scraper_responded = True                    
+                    scraper_responded = True
                     break
 
         if not scraper_responded:
@@ -1175,6 +1396,7 @@ if __name__ == '__main__':
     log.info(f"   State:    {STATE_FILE}")
     log.info(f"   Page recycled every {PAGE_RECYCLE_CYCLES} cycles "
              f"(~{PAGE_RECYCLE_CYCLES * CONFIG['poll_interval_min']} min)")
+    log.info(f"   Ended liveblog cooldown: {CONFIG['ended_liveblog_cooldown_min']} min")
 
     if not SESSION_FILE.exists():
         log.error("No session file — run: python bloomberg_camoufox/setup.py")
@@ -1184,10 +1406,10 @@ if __name__ == '__main__':
     t.start()
 
     log.info(f"🌐 API on http://localhost:{CONFIG['port']}")
-    log.info(f"   GET /health")
-    log.info(f"   GET /posts?since=0")
-    log.info(f"   GET /latest")
-    log.info(f"   GET /refresh")
+    log.info("   GET /health")
+    log.info("   GET /posts?since=0")
+    log.info("   GET /latest")
+    log.info("   GET /refresh")
 
     app.run(
         host='0.0.0.0',
